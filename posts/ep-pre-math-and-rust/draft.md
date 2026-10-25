@@ -1,18 +1,16 @@
-# 前置篇｜拆解大模型前的两件趁手兵器：张量线性代数与 Rust 极简入门
+# 前置篇｜动手前的两件基础工具：多维矩阵线性代数与 Rust 极简入门
 
-很多人想彻底搞懂大语言模型（LLM）内部到底是怎么算的，但往往在第一步就被两座大山劝退了：
+在开始后续的实验之前，我们先用这一篇独立的先导文章，把接下来会反复用到的**线性代数知识**和**Rust 编程基础**一次性讲清楚。
 
-第一座山是**线性代数**。一翻开教材，满眼都是行列式、伴随矩阵、逆矩阵、特征值分解、若尔当标准型——还没看到神经网络，就已经被绕晕了。但真相是：**上面提到的这些概念，在大语言模型的前向推理（Inference）里，一个都用不到！**
+很多人在大学里学线性代数时，花了几十个学时去算行列式、伴随矩阵、逆矩阵、特征值分解和若尔当标准型。但好消息是：**在我们接下来的所有矩阵计算里，上面这些复杂的概念一个都用不到。**
 
-第二座山是**编程语言**。为了不让框架黑盒遮住底层细节，我们这个系列用 **Rust**（配合 Hugging Face 极简张量库 `candle-core`）手写白盒探针。没写过 Rust 的朋友一听“所有权、生命周期、宏编程”就容易发怵。但真相同样很简单：**写一个工业级大模型推理探针，根本用不到复杂的生命周期标注和宏，只需要掌握 6 个最基础的语法结构，30 分钟就能看懂全部源码。**
+同样，很多没接触过 Rust 的朋友一听“所有权、生命周期、宏编程”就容易望而却步。但实际上，用 Rust 写数值与矩阵计算程序，代码长得和 Python（NumPy / PyTorch）有八成相似——你只需要掌握最核心的 **6 个基础语法点**，就能毫无障碍地读懂和修改后续的全部代码。
 
-这篇文章就是为你准备的“最小够用工具箱（Just-in-Time Toolkit）”：
-- **上半场（第一至五节）**：只讲大模型推理真正用到的 **5 条张量与线性代数法则**。学会它们，第零篇里的每一处矩阵变形你都能用纸笔算出来。
-- **下半场（第六至十节）**：专为有 Python / C / JS / Java 基础的读者准备的 **Rust 与 `candle` 30 分钟极简速成**。我们直接拿本系列第零篇的真实代码当例子，把你会遇到的每一个符号拆开讲透。
+因此，本篇完全不涉及任何复杂的业务概念，只单纯讲透两件事：
+- **上半场（第一至六节）**：只讲多维数组（张量）计算真正要用到的 **6 条线性代数与数值法则**（维度拆解、向量点积、矩阵乘法与转置、逐元素乘法、内存步长与广播、以及均方根与 Softmax 归一化）。
+- **下半场（第七至十二节）**：专为有其他语言（Python / C / JS / Java）基础的读者准备的 **Rust 与 `candle` 张量库极简入门**。
 
-如果你已经熟悉矩阵维度变换与 Rust 基础语法，可以直接跳过本篇，前往**《第零篇｜一次大语言模型推理的完整旅程：从输入文本到下一个 Token》**。
-
-本篇的所有数学与代码例子都内置在配套仓库（[https://github.com/wittkung/llm](https://github.com/wittkung/llm)）的 [`crates/llm-tracer/src/prelude.rs`](../../crates/llm-tracer/src/prelude.rs) 中。克隆仓库后，不需要下载任何模型文件，直接运行下面这行命令就能在终端看到本篇全部 5 组实验的真实输出：
+本篇的所有数学与代码例子都整理在配套仓库（[https://github.com/wittkung/llm](https://github.com/wittkung/llm)）的 [`crates/llm-tracer/src/prelude.rs`](../../crates/llm-tracer/src/prelude.rs) 中。克隆仓库后，运行下面这行命令即可在终端看到本篇全部 6 组实验的输出：
 
 ```bash
 git clone https://github.com/wittkung/llm.git
@@ -22,33 +20,35 @@ cargo run -- --mode prelude
 
 ---
 
-## 上半场：大模型推理只用到的 5 条张量与线性代数法则
+## 上半场：多维数组与线性代数的 6 条核心法则
 
 ---
 
-## 一、 法则 1：从标量到四维张量——怎么一眼看懂 `[B, h, T, d_h]`？
+## 一、 法则 1：从标量到四维张量——怎么看懂多维数组的形状（Shape）？
 
-在深度学习代码里，你每隔三行就会看到“张量（Tensor）”这个词，以及一串像 `[49152, 576]`、`[1, 10, 576]`、`[1, 9, 10, 64]` 这样的方括号数字。
+在数值计算代码里，我们把带形状（Shape / Dimensions）的多维数组统称为**张量（Tensor）**。你经常会看到类似 `[4]`、`[5, 4]`、`[1, 3, 4]`、`[1, 2, 3, 2]` 这样的方括号标记。
 
-别被“张量”这个数学名词唬住。在计算机程序里，**张量就是一个规定了形状（Shape / Dims）的多维浮点数（或整数）数组**。方括号里有几个数字，它就是几维（几阶）张量：
+读懂任何张量的第一步，就是数一数**方括号里有几个数字**：有几个数字，它就是几维（几阶，Rank）张量：
 
-| 维度阶数 (Rank) | 数学名称 | 形状写法示例 | 在大模型里代表什么？ | 直观例子 |
+| 维度阶数 (Rank) | 数学名称 | 形状写法示例 | 直观结构理解 | 具体例子 |
 |---|---|---|---|---|
-| **0 维** | **标量 (Scalar)** | `[]` 或单个数字 | 单个数值（如缩放系数、最终挑出的单个词号） | `19556` 或 `0.125` |
-| **1 维** | **向量 (Vector)** | `[d]`（如 `[4]` 或 `[576]`） | **一个词元（Token）的特征表示**，或者 RMSNorm 的一维缩放权重 | `[1.0, 0.0, 1.0, 0.0]`（用 4 个数字描述 1 个词） |
-| **2 维** | **矩阵 (Matrix)** | `[行, 列]`（如 `[5, 4]` 或 `[49152, 576]`） | **模型的静态参数权重表**（如词嵌入表 `[词表大小 V, 特征宽度 d]`） | 一张有 5 行、每行 4 个数字的二维表格 |
-| **3 维** | **三维张量** | **`[B, T, d]`**（如 `[1, 3, 4]` 或 `[1, 10, 576]`） | **流过模型主干的序列隐藏状态**（$B$ 句话，每句 $T$ 个词，每词 $d$ 个特征） | 把 $B=1$ 句话里的 $T=3$ 个词向量按顺序摞成一沓 |
-| **4 维** | **四维张量** | **`[B, h, T, d_h]`**（如 `[1, 2, 3, 2]` 或 `[1, 9, 10, 64]`） | **多头注意力内部张量**（把每个词的 $d$ 维特征拆给 $h$ 个注意力头，每头分到 $d_h$ 维） | $B$ 句话、$h$ 个独立视角、每个视角看 $T$ 个词的 $d_h$ 维切片 |
+| **0 维** | **标量 (Scalar)** | `[]` | 单独的一个数字（没有方括号包裹） | `3.14` 或 `42` |
+| **1 维** | **向量 (Vector)** | `[4]` | 一排连续排列的 4 个数字 | `[1.0, 0.0, 1.0, 0.0]` |
+| **2 维** | **矩阵 (Matrix)** | `[5, 4]` | 一张 **5 行、4 列** 的二维表格（共 $5 \times 4 = 20$ 个数） | Excel 表格：行号 `0..4`，列号 `0..3` |
+| **3 维** | **三维张量** | `[1, 3, 4]` | 把 **1 组**、每组 **3 行 4 列** 的二维表格摞在一起 | 1 个批次，包含 3 行，每行 4 个浮点数 |
+| **4 维** | **四维张量** | `[1, 2, 3, 2]` | 外层有 1 个大盒，里面装 2 个中盒，每个中盒里是一张 $3 \times 2$ 的表格 | 元素总数 $= 1 \times 2 \times 3 \times 2 = 12$ 个数 |
 
-我们拿 `prelude.rs` 里的第一组实验举例。假设我们的迷你词表里一共有 $V = 5$ 个词，每个词用 $d = 4$ 个浮点数表示，那么词嵌入表 `embed_table` 就是一个形状为 **`[5, 4]`** 的二维矩阵：
+**读维度的通用口诀：从左往右看，就是从最外层括号往最里层括号一层层剥开；所有维度的数字乘起来，就是张量里包含的数字总个数。**
 
-$$\mathbf{E}_{[5, 4]} = \begin{bmatrix} 0.1 & 0.2 & 0.3 & 0.4 \\ 1.0 & 0.0 & 1.0 & 0.0 \\ 0.0 & 2.0 & 0.0 & 1.0 \\ 1.0 & 1.0 & 0.0 & 2.0 \\ 0.5 & 0.5 & 0.5 & 0.5 \end{bmatrix} \begin{matrix} \leftarrow \text{第 0 号词} \\ \leftarrow \text{第 1 号词} \\ \leftarrow \text{第 2 号词} \\ \leftarrow \text{第 3 号词} \\ \leftarrow \text{第 4 号词} \end{matrix}$$
+例如，我们有一张 5 行 4 列的二维表格 `table`（形状为 **`[5, 4]`**）：
 
-现在用户输入了 $B = 1$ 句话，里面包含 $T = 3$ 个词，词号分别是 `[1, 2, 3]`（形状为 `[1, 3]`）。模型要做的第一件事（即第零篇的**阶段 02：词嵌入查表**），就是去上面那张 `[5, 4]` 的表里，把第 `1` 行、第 `2` 行、第 `3` 行原封不动地抽出，拼成一个形状为 **`[1, 3, 4]`**（即 `[B=1, T=3, d=4]`）的三维张量 $\mathbf{X}$：
+$$\mathbf{T}_{[5, 4]} = \begin{bmatrix} 0.1 & 0.2 & 0.3 & 0.4 \\ 1.0 & 0.0 & 1.0 & 0.0 \\ 0.0 & 2.0 & 0.0 & 1.0 \\ 1.0 & 1.0 & 0.0 & 2.0 \\ 0.5 & 0.5 & 0.5 & 0.5 \end{bmatrix} \begin{matrix} \leftarrow \text{第 0 行} \\ \leftarrow \text{第 1 行} \\ \leftarrow \text{第 2 行} \\ \leftarrow \text{第 3 行} \\ \leftarrow \text{第 4 行} \end{matrix}$$
+
+如果我们给出一串行号索引 `row_indices = [1, 2, 3]`，想按行（第 0 维）从 `table` 里把第 `1`、第 `2`、第 `3` 行抽出来，拼成一张 `[3, 4]` 的子表格，再给最外层套一层括号变成三维张量 **`[1, 3, 4]`**，在代码中只需调用 `index_select`：
 
 ```rust
-// 对应 crates/llm-tracer/src/prelude.rs 第 [1/5] 节
-let embed_table = Tensor::from_slice(
+// 对应 crates/llm-tracer/src/prelude.rs 第 [1/6] 节
+let table = Tensor::from_slice(
     &[
         0.1f32, 0.2, 0.3, 0.4, // 第 0 行
         1.0, 0.0, 1.0, 0.0,    // 第 1 行
@@ -56,73 +56,65 @@ let embed_table = Tensor::from_slice(
         1.0, 1.0, 0.0, 2.0,    // 第 3 行
         0.5, 0.5, 0.5, 0.5,    // 第 4 行
     ],
-    (5, 4), // 指定形状为 [5, 4]
+    (5, 4), // 形状为 5 行 4 列
     dev,
 )?;
-let input_ids = Tensor::from_slice(&[1u32, 2, 3], (1, 3), dev)?;
-let flat_ids = input_ids.flatten_all()?; // 展平为一维 [3]，供 index_select 查表
-let x = embed_table.index_select(&flat_ids, 0)?.reshape((1, 3, 4))?;
+let row_indices = Tensor::from_slice(&[1u32, 2, 3], (3,), dev)?;
+// 沿着第 0 维（行维度）按索引抽出第 1, 2, 3 行，得到 [3, 4]，再重塑为 [1, 3, 4]
+let picked_2d = table.index_select(&row_indices, 0)?;
+let tensor_3d = picked_2d.reshape((1, 3, 4))?;
 ```
 
-运行 `cargo run -- --mode prelude`，你会看到终端打印出查表后的三维张量 `x`：
+运行 `cargo run -- --mode prelude`，终端第一部分输出如下：
 
 ```text
---- [1/5] Tensor Dimensions & Embedding Row Lookup (index_select) ---
-  embed_table shape: [5, 4] (Static Weight [V=5, d=4])
-  input_ids   shape: [1, 3] (Token IDs [B=1, T=3])
-  x (looked up)    : [1, 3, 4] -> [[1.0, 0.0, 1.0, 0.0], [0.0, 2.0, 0.0, 1.0], [1.0, 1.0, 0.0, 2.0]]
+--- [1/6] Tensor Shapes (1D / 2D / 3D) & Row Lookup (index_select) ---
+  2D table     shape: [5, 4]
+  row_indices  shape: [3]
+  tensor_3d    shape: [1, 3, 4] -> [[1.0, 0.0, 1.0, 0.0], [0.0, 2.0, 0.0, 1.0], [1.0, 1.0, 0.0, 2.0]]
 ```
-
-**读维度的小窍门：从左往右看，就是从外层括号往里层括号剥。**
-看到 `x` 的形状是 `[1, 3, 4]`：
-- 最外层有 `1` 个句子；
-- 剥开一层，里面有 `3` 个词；
-- 再剥开一层，每个词是一串长度为 `4` 的浮点数向量（如第 1 个词是 `[1.0, 0.0, 1.0, 0.0]`）。
 
 ---
 
-## 二、 法则 2：向量点积（Dot Product）——大模型测量“两个词配不配”的唯一尺子
+## 二、 法则 2：向量点积（Dot Product）——如何用一个数字衡量两个向量的方向相似度？
 
-在大模型的注意力机制（Attention）里，当前词手握一个查询向量 $\mathbf{q}$（Query，代表“我想找什么信息”），历史上的每个词各举着一个键向量 $\mathbf{k}$（Key，代表“我这里有什么信息”）。
+假设有两个长度相同的一维向量 $\mathbf{a} = [a_1, a_2, \dots, a_k]$ 和 $\mathbf{b} = [b_1, b_2, \dots, b_k]$。它们之间最基础的运算叫做**向量点积（Dot Product，也叫内积）**，记作 $\mathbf{a} \cdot \mathbf{b}$。
 
-计算机怎么判断 $\mathbf{q}$ 和哪个 $\mathbf{k}$ 最匹配？答案是算它们的**向量点积（Dot Product，也叫内积）**。
+### 1. 代数算法：对应位置相乘，再全部加起来
 
-### 1. 代数怎么算？对应位置相乘，再全部加起来
+点积的计算规则非常简单——把两个向量相同下标位置的数字两两相乘，最后把乘积加成一个标量数字：
 
-两个向量要做点积，**长度必须完全相等**。假设有两个长度为 2 的向量 $\mathbf{q} = [q_1, q_2]$ 和 $\mathbf{k} = [k_1, k_2]$，它们的点积就是一个标量数字：
+$$\mathbf{a} \cdot \mathbf{b} = a_1 b_1 + a_2 b_2 + \dots + a_k b_k = \sum_{i=1}^{k} a_i b_i$$
 
-$$\mathbf{q} \cdot \mathbf{k} = q_1 \times k_1 + q_2 \times k_2$$
+注意前提：**只有长度相等的两个向量才能做点积**；算出来的结果不再是向量，而是**一个单独的数字**。
 
-### 2. 几何上为什么能测量相似度？
+### 2. 几何含义：为什么点积能测量两个向量的方向有多像？
 
-在几何上，两个向量的点积等于它们各自的长度（模长）乘以它们夹角 $\theta$ 的余弦值：
+在平面或高维空间里，每个向量都可以看作从原点出发的一根箭头。数学上可以严格证明，两个向量的点积等于它们各自的长度（模长 $\|\mathbf{a}\|, \|\mathbf{b}\|$）乘以它们夹角 $\theta$ 的余弦值：
 
-$$\mathbf{q} \cdot \mathbf{k} = \|\mathbf{q}\| \|\mathbf{k}\| \cos\theta$$
+$$\mathbf{a} \cdot \mathbf{b} = \|\mathbf{a}\| \|\mathbf{b}\| \cos\theta$$
 
-因此：
-- 当两个向量**方向完全相同**（夹角 $\theta = 0^\circ, \cos 0^\circ = 1$）时，点积达到**正的最大值**（高度匹配）；
-- 当两个向量**互相垂直 / 正交**（夹角 $\theta = 90^\circ, \cos 90^\circ = 0$，毫不相干）时，点积等于 **`0`**；
-- 当两个向量**方向完全相反**（夹角 $\theta = 180^\circ, \cos 180^\circ = -1$）时，点积是**负数**（强烈排斥）。
+因为余弦函数 $\cos\theta$ 在 $\theta = 0^\circ$ 时为 $1$、在 $\theta = 90^\circ$ 时为 $0$、在 $\theta = 180^\circ$ 时为 $-1$，点积天然就是一把测量“方向相似度”的尺子：
+- **方向一致（$\theta = 0^\circ$）**：点积取得**正的最大值**；
+- **夹角为锐角（$0^\circ < \theta < 90^\circ$）**：点积为**正数**，越接近同向数值越大；
+- **互相垂直 / 正交（$\theta = 90^\circ$）**：$\cos 90^\circ = 0$，点积恒等于 **`0`**（两个方向完全独立、互不相关）；
+- **方向相反（$90^\circ < \theta \le 180^\circ$）**：点积为**负数**。
 
-我们直接用 `prelude.rs` 里的第二组实验验证。设查询向量 $\mathbf{q} = [2.0, 0.0]$（指向正右方），去和三个候选键向量做点积：
-- 候选 1：$\mathbf{k}_1 = [1.0, 1.0]$（指向右上 $45^\circ$）$\to$ 点积 $= 2.0 \times 1.0 + 0.0 \times 1.0 = \mathbf{2.0}$；
-- 候选 2：$\mathbf{k}_2 = [2.0, 0.0]$（同样指向正右方，方向与 $\mathbf{q}$ 完全一致）$\to$ 点积 $= 2.0 \times 2.0 + 0.0 \times 0.0 = \mathbf{4.0}$（得分最高！）；
-- 候选 3：$\mathbf{k}_3 = [0.0, 2.0]$（指向正上方，与 $\mathbf{q}$ 垂直 $90^\circ$）$\to$ 点积 $= 2.0 \times 0.0 + 0.0 \times 2.0 = \mathbf{0.0}$（毫不相关）。
+我们看 `prelude.rs` 里的第二组实验。设平面向量 $\mathbf{a} = [2.0, 0.0]$（指向正右方），分别与三个向量 $\mathbf{b}_1, \mathbf{b}_2, \mathbf{b}_3$ 做点积：
+- $\mathbf{b}_1 = [1.0, 1.0]$（指向右上 $45^\circ$）：$\mathbf{a} \cdot \mathbf{b}_1 = 2.0 \times 1.0 + 0.0 \times 1.0 = \mathbf{2.0}$；
+- $\mathbf{b}_2 = [2.0, 0.0]$（同样指向正右方，夹角 $0^\circ$）：$\mathbf{a} \cdot \mathbf{b}_2 = 2.0 \times 2.0 + 0.0 \times 0.0 = \mathbf{4.0}$（最高）；
+- $\mathbf{b}_3 = [0.0, 2.0]$（指向正上方，与 $\mathbf{a}$ 垂直 $90^\circ$）：$\mathbf{a} \cdot \mathbf{b}_3 = 2.0 \times 0.0 + 0.0 \times 2.0 = \mathbf{0.0}$。
 
 ```text
---- [2/5] Dot Product: Measuring Similarity (q · k) ---
-  q [1, 2] · keys^T [2, 3] -> scores [1, 3] = [[2.0, 4.0, 0.0]]
+--- [2/6] Vector Dot Product (a · b) ---
+  a [1, 2] · b_list^T [2, 3] -> [1, 3] = [[2.0, 4.0, 0.0]]
 ```
-
-记住这个直觉：整座大模型里最核心的注意力分数矩阵 $\mathbf{Q}\mathbf{K}^\top$，本质上不过是在批量计算每一对词向量之间的点积。
 
 ---
 
-## 三、 法则 3：矩阵乘法（MatMul）与“中间维度抵消律”
+## 三、 法则 3：矩阵乘法（MatMul）、中间维度抵消律与转置（Transpose）
 
-整座大模型 99% 的计算时间都花在同一种运算上：**矩阵乘法（Matrix Multiplication，代码中写作 `matmul`）**。
-
-要看懂所有线性投影层的形状变化，你只需要死死记住两条铁律：
+理解了向量点积，**矩阵乘法（Matrix Multiplication，代码中写作 `matmul`）** 就没有任何秘密了：矩阵乘法不过是把左矩阵的每一行与右矩阵的每一列两两配对，批量做向量点积。
 
 ### 1. 铁律一：中间维度必须相等并抵消，外侧维度保留
 
@@ -130,321 +122,364 @@ $$\mathbf{q} \cdot \mathbf{k} = \|\mathbf{q}\| \|\mathbf{k}\| \cos\theta$$
 
 $$\underbrace{[M, \mathbf{K}]}_{\text{左矩阵 } \mathbf{A}} \times \underbrace{[\mathbf{K}, N]}_{\text{右矩阵 } \mathbf{B}} \longrightarrow \underbrace{[M, N]}_{\text{结果矩阵 } \mathbf{C}}$$
 
-- **怎么算的？** 结果矩阵 $\mathbf{C}$ 的第 $i$ 行、第 $j$ 列的那个数字，就是拿左矩阵 $\mathbf{A}$ 的**第 $i$ 整行**（长度为 $K$ 的向量）与右矩阵 $\mathbf{B}$ 的**第 $j$ 整列**（长度也为 $K$ 的向量）做一次**向量点积**！
-- **为什么中间的 $K$ 必须相等？** 因为左边的“行长”等于它的列数 $K$，右边的“列长”等于它的行数 $K$——如果这两个数不相等，点积就无法一一对应相乘。
-- **怎么秒推输出形状？** 把两个矩阵的形状并排写在一起 `[M, K] × [K, N]`，像玩消消乐一样**把挨在一起的两个内侧维度 `K` 划掉**，剩下的外侧维度 **`[M, N]`** 就是输出矩阵的形状！
+1. **为什么中间的两个数字必须都是 `K`？**
+   因为运算规则是拿左矩阵 $\mathbf{A}$ 的**第 $i$ 行**（这一行有 $K$ 个数）去和右矩阵 $\mathbf{B}$ 的**第 $j$ 列**（这一列也有 $K$ 个数）做向量点积：
+   $$C_{i, j} = (\mathbf{A} \text{ 的第 } i \text{ 行}) \cdot (\mathbf{B} \text{ 的第 } j \text{ 列}) = \sum_{k=1}^{K} A_{i, k} B_{k, j}$$
+   如果左矩阵的列数不等于右矩阵的行数，行向量和列向量的长度就对不上，根本无法做点积。
+2. **怎么一秒钟写出结果矩阵的形状？**
+   把两个矩阵的形状并排写在一起 `[M, K] × [K, N]`，**把紧挨着的内侧维度 `K` 划掉（抵消）**，剩下的左外侧行数 `M` 和右外侧列数 `N` 拼起来 **`[M, N]`**，就是输出矩阵的形状！
 
-### 2. 铁律二：为什么权重矩阵在相乘前总是要调用转置 `.t()`？
+### 2. 铁律二：什么是矩阵转置（Transpose, `.t()`）？
 
-在 PyTorch 和 Hugging Face 的 `.safetensors` 权重文件里，有一个统一的工业界约定：**线性层权重矩阵 $\mathbf{W}$ 的存储形状永远是 `[输出维度 d_out, 输入维度 d_in]`**。
+**矩阵转置（记作 $\mathbf{W}^\top$，代码中调用 `w.t()?`）** 就是沿着主对角线把矩阵翻折过来：**把原来的第 $i$ 行竖过来变成第 $i$ 列**。因此，一个形状为 `[M, N]` 的矩阵转置后，形状会反转成 **`[N, M]`**。
 
-比如在 `prelude.rs` 的第三组实验里，我们的输入 `x` 每个词有 `d_in = 4` 个特征，想通过线性层压成 `d_out = 2` 个特征。此时权重矩阵 `w_proj` 在文件里的形状是 **`[2, 4]`**：
+为什么我们在代码里经常要先调一次 `.t()` 再做矩阵乘法？
+看 `prelude.rs` 里的第三组实验：刚才我们抽出了形状为 **`[3, 4]`** 的二维矩阵 `picked_2d`，手头还有一张形状为 **`[2, 4]`** 的变换矩阵 `w`：
 
-$$\mathbf{W}_{\text{proj } [2, 4]} = \begin{bmatrix} 1.0 & 0.0 & 1.0 & 0.0 \\ 0.0 & 1.0 & 0.0 & 1.0 \end{bmatrix}$$
+$$\mathbf{P}_{[3, 4]} = \begin{bmatrix} 1.0 & 0.0 & 1.0 & 0.0 \\ 0.0 & 2.0 & 0.0 & 1.0 \\ 1.0 & 1.0 & 0.0 & 2.0 \end{bmatrix}, \quad \mathbf{W}_{[2, 4]} = \begin{bmatrix} 1.0 & 0.0 & 1.0 & 0.0 \\ 0.0 & 1.0 & 0.0 & 1.0 \end{bmatrix}$$
 
-现在问题来了：如果我们的输入矩阵是 `[3, 4]`（3 个词，每词 4 维），能直接去乘 `[2, 4]` 的 `w_proj` 吗？
-把形状并排摆出来看：`[3, 4] × [2, 4]` —— 中间挨着的两个数字一个是 `4`，一个是 `2`，**不相等，根本没法乘！**
+`[3, 4]` 和 `[2, 4]` 中间挨着的数字是 `4` 和 `2`，不能直接相乘。但只要把 $\mathbf{W}_{[2, 4]}$ 转置成 $\mathbf{W}_{[4, 2]}^\top$（把它的 2 行变成 2 列）：
 
-怎么办？把权重矩阵 `w_proj` **转置（Transpose，记作 $\mathbf{W}^\top$，代码里写 `w_proj.t()?`）**！
-什么叫矩阵转置？就是**把原来的第 $i$ 行竖过来变成第 $i$ 列**，行号和列号对调，形状从 `[2, 4]` 变成 **`[4, 2]`**：
+$$\mathbf{W}_{[4, 2]}^\top = \begin{bmatrix} 1.0 & 0.0 \\ 0.0 & 1.0 \\ 1.0 & 0.0 \\ 0.0 & 1.0 \end{bmatrix}$$
 
-$$\mathbf{W}_{\text{proj } [4, 2]}^\top = \begin{bmatrix} 1.0 & 0.0 \\ 0.0 & 1.0 \\ 1.0 & 0.0 \\ 0.0 & 1.0 \end{bmatrix}$$
+此时形状变成 **`[3, 4] × [4, 2]`**，中间的 `4` 完美抵消，输出形状为 **`[3, 2]`**：
 
-现在再把形状并排摆出来：
+$$\mathbf{P}_{[3, 4]} \times \mathbf{W}_{[4, 2]}^\top = \begin{bmatrix} 1\times 1 + 0\times 0 + 1\times 1 + 0\times 0 & 1\times 0 + 0\times 1 + 1\times 0 + 0\times 1 \\ 0\times 1 + 2\times 0 + 0\times 1 + 1\times 0 & 0\times 0 + 2\times 1 + 0\times 0 + 1\times 1 \\ 1\times 1 + 1\times 0 + 0\times 1 + 2\times 0 & 1\times 0 + 1\times 1 + 0\times 0 + 2\times 1 \end{bmatrix} = \begin{bmatrix} 2.0 & 0.0 \\ 0.0 & 3.0 \\ 1.0 & 3.0 \end{bmatrix}$$
 
-$$[3, \mathbf{4}] \times [\mathbf{4}, 2] \xrightarrow{\text{中间的 4 抵消}} [3, 2]$$
-
-我们亲手算一下第 1 个词 `[1.0, 0.0, 1.0, 0.0]` 乘以 $\mathbf{W}_{\text{proj}}^\top$ 的两列：
-- 乘第 1 列 `[1.0, 0.0, 1.0, 0.0]`：$1\times 1 + 0\times 0 + 1\times 1 + 0\times 0 = \mathbf{2.0}$；
-- 乘第 2 列 `[0.0, 1.0, 0.0, 1.0]`：$1\times 0 + 0\times 1 + 1\times 0 + 0\times 1 = \mathbf{0.0}$。
-所以第 1 个词投影后的结果就是 `[2.0, 0.0]`！
-
-### 3. 三维激活 `[B, T, d_in]` 怎么和二维权重 `[d_in, d_out]` 相乘？
-
-在实际推理中，输入 `x` 带着批大小 $B$，是三维张量 `[B, T, d_in]`（如 `[1, 3, 4]`）；而转置后的权重 `weight.t()?` 是二维矩阵 `[4, 2]`。在 `candle-core` 中，`matmul` 要求左右两边的维度阶数（Rank）相同。
-
-因此，我们在 [`src/ops.rs`](../../crates/llm-tracer/src/ops.rs) 的 `linear_no_bias` 函数里用了最经典的三步法：
-1. 先用 `.reshape((b * t, d_in))?` 把前两维（句子数 $B$ 和词数 $T$）合并成二维矩阵 **`[B * T, d_in]`**（即总共 $B \times T$ 个词，排成一张大表）；
-2. 做标准二维矩阵乘法：`[B * T, d_in] × [d_in, d_out] -> [B * T, d_out]`；
-3. 再用 `.reshape((b, t, d_out))?` 还原回三维张量 **`[B, T, d_out]`**：
-
-```rust
-// crates/llm-tracer/src/ops.rs 中的算子 1
-pub fn linear_no_bias(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
-    let (b, t, d_in) = x.dims3()?;
-    let (d_out, _) = weight.dims2()?;
-    x.reshape((b * t, d_in))?
-        .matmul(&weight.t()?)?
-        .reshape((b, t, d_out))
-}
+```text
+--- [3/6] Matrix Multiplication & Middle-Dimension Cancellation ---
+  picked_2d [3, 4] x w^T [4, 2] -> out_2d [3, 2]: [[2.0, 0.0], [0.0, 3.0], [1.0, 3.0]]
 ```
+
+### 3. 三维张量 `[B, M, K]` 怎么和二维矩阵 `[K, N]` 相乘？
+
+如果左边的张量多了一层外框，形状是三维的 `[B, M, K]`（比如 `[1, 3, 4]`），而右边是二维矩阵 `[4, 2]`，怎么乘？
+因为 `B` 组数据里的每一行都要乘同一个右矩阵，最直接的做法是：
+1. 先用 `.reshape((b * m, k))?` 把前两维合并成二维矩阵 **`[B * M, K]`**；
+2. 做标准二维矩阵乘法：`[B * M, K] × [K, N] -> [B * M, N]`；
+3. 最后再用 `.reshape((b, m, n))?` 把外框还原回三维 **`[B, M, N]`**。
 
 ---
 
-## 四、 法则 4：千万别混的两种乘法——矩阵乘法 `matmul` vs. 逐元素乘法 `*`
+## 四、 法则 4：区分矩阵乘法 `matmul` 与逐元素乘法 `*`（Hadamard 积）
 
-读大模型公式和代码时，新手最容易搞混的莫过于这两种乘法：
+在公式和代码里，有两种乘法长得很像，但算法完全不同：
 
 | 对比维度 | **矩阵乘法（Matrix Multiplication）** | **逐元素乘法（Element-wise / Hadamard Product）** |
 |---|---|---|
-| **数学符号** | $\mathbf{A}\mathbf{B}$ 或 $\mathbf{A} \times \mathbf{B}$（中间不写点或写叉号） | $\mathbf{A} \odot \mathbf{B}$（带圈的点） |
-| **Rust `candle` 写法** | `a.matmul(&b)?` | `(&a * &b)?`（直接用星号 `*`） |
-| **输入形状要求** | 内侧维度相等：`[M, K]` 与 `[K, N]` | **两个张量的形状必须一模一样**：`[M, N]` 与 `[M, N]` |
-| **输出形状与算法** | 输出 `[M, N]`；行与列做点积求和 | 输出仍是 `[M, N]`；**相同坐标位置上的两个数直接相乘，互不串门** |
-| **在第零篇哪里用到？** | QK 点积得分、线性层投影（阶段 04/05/06/07/09） | **阶段 07 SwiGLU MLP 的门控相乘**：`(&gate * &up)?` |
+| **数学符号** | $\mathbf{M}_1 \mathbf{M}_2$ 或 $\mathbf{M}_1 \times \mathbf{M}_2$ | $\mathbf{M}_1 \odot \mathbf{M}_2$（带圈的圆点） |
+| **Rust `candle` 写法** | `m1.matmul(&m2)?` | `(&m1 * &m2)?`（直接使用乘号 `*`） |
+| **形状要求** | 内侧维度相等：`[M, K]` 与 `[K, N]` | **两个张量的形状必须完全相同**：`[M, N]` 与 `[M, N]` |
+| **计算规则** | 第 $i$ 行与第 $j$ 列做向量点积求和，输出 `[M, N]` | **相同位置 `(i, j)` 上的两个数字直接相乘**，输出仍是 `[M, N]` |
 
-看 `prelude.rs` 里的第四组实验：同样拿两个 $2 \times 2$ 的矩阵 `gate` 和 `up`，分别做逐元素乘法 `(&gate * &up)?` 和矩阵乘法 `gate.matmul(&up)?`：
+看 `prelude.rs` 里的第四组实验：给定两个相同的 $2 \times 2$ 矩阵 $\mathbf{M}_1$ 和 $\mathbf{M}_2$：
 
-$$\text{gate} = \begin{bmatrix} 0.5 & 2.0 \\ 0.0 & 1.5 \end{bmatrix}, \quad \text{up} = \begin{bmatrix} 4.0 & 3.0 \\ 9.0 & 2.0 \end{bmatrix}$$
+$$\mathbf{M}_1 = \begin{bmatrix} 0.5 & 2.0 \\ 0.0 & 1.5 \end{bmatrix}, \quad \mathbf{M}_2 = \begin{bmatrix} 4.0 & 3.0 \\ 9.0 & 2.0 \end{bmatrix}$$
 
-- **逐元素乘法 `(&gate * &up)?`（对应位置直接乘）**：
-  $$\begin{bmatrix} 0.5 \times 4.0 & 2.0 \times 3.0 \\ 0.0 \times 9.0 & 1.5 \times 2.0 \end{bmatrix} = \begin{bmatrix} \mathbf{2.0} & \mathbf{6.0} \\ \mathbf{0.0} & \mathbf{3.0} \end{bmatrix}$$
-  你看左下角：因为 `gate` 左下角是 `0.0`（相当于阀门关死），不管 `up` 左下角是 `9.0` 还是 `900.0`，乘出来立刻变成 `0.0`——这就是第零篇阶段 07“门控（Gating）”名字的由来！
-- **矩阵乘法 `gate.matmul(&up)?`（行乘列再相加）**：
-  $$\begin{bmatrix} 0.5\times 4.0 + 2.0\times 9.0 & 0.5\times 3.0 + 2.0\times 2.0 \\ 0.0\times 4.0 + 1.5\times 9.0 & 0.0\times 3.0 + 1.5\times 2.0 \end{bmatrix} = \begin{bmatrix} \mathbf{20.0} & \mathbf{5.5} \\ \mathbf{13.5} & \mathbf{3.0} \end{bmatrix}$$
+- **逐元素乘法 `(&m1 * &m2)?`（各自对应位置相乘，互不干扰）**：
+  $$\mathbf{M}_1 \odot \mathbf{M}_2 = \begin{bmatrix} 0.5 \times 4.0 & 2.0 \times 3.0 \\ 0.0 \times 9.0 & 1.5 \times 2.0 \end{bmatrix} = \begin{bmatrix} \mathbf{2.0} & \mathbf{6.0} \\ \mathbf{0.0} & \mathbf{3.0} \end{bmatrix}$$
+  注意看左下角：只要 $\mathbf{M}_1$ 某个位置是 `0.0`，做逐元素乘法时就会像开关一样把 $\mathbf{M}_2$ 对应位置的数值（`9.0`）直接清零。
+- **矩阵乘法 `m1.matmul(&m2)?`（行与列做点积求和）**：
+  $$\mathbf{M}_1 \mathbf{M}_2 = \begin{bmatrix} 0.5\times 4.0 + 2.0\times 9.0 & 0.5\times 3.0 + 2.0\times 2.0 \\ 0.0\times 4.0 + 1.5\times 9.0 & 0.0\times 3.0 + 1.5\times 2.0 \end{bmatrix} = \begin{bmatrix} \mathbf{20.0} & \mathbf{5.5} \\ \mathbf{13.5} & \mathbf{3.0} \end{bmatrix}$$
 
 ---
 
-## 五、 法则 5：形状重排、内存步长（Stride）、`.contiguous()` 与广播
+## 五、 法则 5：内存步长（Stride）——为什么会有 `reshape`、`transpose`、`.contiguous()` 与广播？
 
-在多头注意力（阶段 04 和 05）的代码里，你会看到一行非常经典的链式调用：
+在写多维张量代码时，我们经常要调整张量的形状（比如把 `[1, 3, 4]` 拆成四维 `[1, 3, 2, 2]`，再交换中间两个维度变成 `[1, 2, 3, 2]`）：
 
 ```rust
-let q = q_lin.reshape((b, seq_len, h_q, d_h))?.transpose(1, 2)?.contiguous()?;
+let reshaped = tensor_3d.reshape((1, 3, 2, 2))?;
+let transposed = reshaped.transpose(1, 2)?;
+let contiguous = transposed.contiguous()?;
 ```
 
-很多写过好几年 PyTorch 的人也说不清：**`reshape` 和 `transpose` 到底有什么区别？为什么 `transpose(1, 2)` 后面非要加一个 `.contiguous()`？**
+要明白这三行代码在干什么，以及**为什么 `transpose(1, 2)` 之后往往要调用 `.contiguous()`**，只需要记住计算机硬件的一个基本事实：**计算机物理内存是一维线性的，没有任何二维或四维的物理格子。**
 
-要彻底搞懂这件事，你只需要知道计算机内存的一个物理真相：**计算机内存条是一维的，根本没有二维或四维的物理格子。**
-
-无论一个张量的逻辑形状是 `[3, 4]`、`[1, 3, 2, 2]` 还是 `[1, 2, 3, 2]`，它在物理内存里永远是一字排开的 **12 个连续浮点数**：
+不管一个张量的逻辑形状是 `[1, 3, 4]`、`[1, 3, 2, 2]` 还是 `[1, 2, 3, 2]`，它在底层物理内存里永远是一排连续存放的 **12 个浮点数**：
 
 ```text
-物理内存一维数组（共 12 个数）：
-下标:  0    1    2    3    4    5    6    7    8    9   10   11
-数值: [1.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 1.0, 1.0, 1.0, 0.0, 2.0]
-       └── 词0,头0 ──┘ └── 词0,头1 ──┘ └── 词1,头0 ──┘ └── 词1,头1 ──┘ ...
+底层物理内存（一维连续数组，共 12 个元素）：
+物理下标:  0    1    2    3    4    5    6    7    8    9   10   11
+元素数值: [1.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 1.0, 1.0, 1.0, 0.0, 2.0]
 ```
 
-那张量怎么知道自己是几维的？靠它随身携带的两个小账本：**形状（`dims`）** 和 **步长（`stride`，即沿着某个维度下标加 1 时，在物理一维数组里需要跨过几个元素）**。
+既然物理内存只有一排数，程序怎么知道它是几维张量？因为 `Tensor` 对象内部维护着两个小数组：
+- **形状（`dims`）**：每个维度有多长；
+- **步长（`stride`）**：沿着某一个维度的坐标加 `1` 时，在底层一维物理数组里需要**跨过几个元素**。
 
-我们结合 `prelude.rs` 第五组实验的真实输出，看清这三步到底干了什么：
+我们结合 `prelude.rs` 第五组实验的打印输出，把这三步看个通透：
 
 ```text
---- [5/5] Split Heads (reshape + transpose + contiguous) & GQA Broadcast ---
-  After reshape [1, 3, 2, 2]: is_contiguous = true | strides = [12, 4, 2, 1]
+--- [5/6] Memory Strides (reshape vs. transpose vs. contiguous) & Broadcast ---
+  After reshape [1, 3, 2, 2]      : is_contiguous = true  | strides = [12, 4, 2, 1]
   After transpose(1, 2) [1, 2, 3, 2]: is_contiguous = false | strides = [12, 2, 4, 1]
-  After .contiguous()   [1, 2, 3, 2]: is_contiguous = true | strides = [12, 6, 2, 1]
+  After .contiguous()   [1, 2, 3, 2]: is_contiguous = true  | strides = [12, 6, 2, 1]
 ```
 
-1. **第一步 `.reshape((1, 3, 2, 2))`（零拷贝重塑视图）**：
-   把每个词长度为 `4` 的向量，原地切成 `h=2` 个头、每头 `d_h=2` 个数，形状从 `[1, 3, 4]` 变成 **`[1, 3, 2, 2]`**（含义：`[1句话, 3个词, 2个头, 每头2维]`）。
-   注意看此时物理内存动了吗？**完全没动！** 步长 `strides = [12, 4, 2, 1]` 从左到右递减，说明按逻辑顺序遍历元素时，物理内存下标正好是 `0, 1, 2, 3...` 顺着往下走，这种状态叫**内存连续（`is_contiguous = true`）**。
-2. **第二步 `.transpose(1, 2)`（交换第 1 维和第 2 维）**：
-   为了让不同注意力头各自独立做矩阵乘法，我们必须把“头数 `h=2`”提到“词数 `T=3`”前面，让形状从 `[1, 3, 2, 2]` 变成 **`[1, 2, 3, 2]`**（`[1句话, 2个头, 3个词, 每头2维]`）。
-   注意：调用 `.transpose(1, 2)` 时，为了速度，它**并没有去搬移物理内存里的数字**，而是直接把账本上的第 1 维和第 2 维步长对调，变成了 `strides = [12, 2, 4, 1]`！
-   这会导致什么后果？现在你想顺着读“第 0 号头的全部 3 个词”，物理内存却得跳着读：先读下标 `0, 1`（词 0 头 0），然后**跳过词 0 头 1** 去读下标 `4, 5`（词 1 头 0），再跳去读下标 `8, 9`（词 2 头 0）！物理内存不挨着了，所以 **`is_contiguous` 变成了 `false`**。
-3. **第三步 `.contiguous()`（按新形状把物理内存真正排整齐）**：
-   后续的 RoPE 旋转算子要求每个头的数据在物理内存里必须紧挨着存放。调用 `.contiguous()` 后，程序才真正分配一块新内存，把“头 0 的 3 个词”排在前面（下标 `0..6`），“头 1 的 3 个词”排在后面（下标 `6..12`），步长恢复为从大到小递减的 `[12, 6, 2, 1]`，`is_contiguous` 重新变回 `true`。
+1. **`.reshape((1, 3, 2, 2))`：零拷贝修改形状标签**
+   把最后一维的 `4` 拆成 `2 × 2`，形状变成 `[1, 3, 2, 2]`。此时底层那 12 个浮点数完全没动，步长是 `[12, 4, 2, 1]`（第 1 维每加 1 跨 4 个数，第 2 维每加 1 跨 2 个数，最后一维每加 1 跨 1 个数）。因为步长从左到右严格按维度大小递减，按逻辑顺序遍历张量时，物理下标恰好是 `0, 1, 2, ..., 11` 顺序递增，这叫**内存连续（`is_contiguous = true`）**。
+2. **`.transpose(1, 2)`：交换第 1 维和第 2 维的坐标轴**
+   调用 `.transpose(1, 2)` 把形状从 `[1, 3, 2, 2]` 变成 `[1, 2, 3, 2]` 时，为了极速完成，它**没有去复制或搬移物理内存里的那 12 个数**，只是把形状和步长的第 1 维、第 2 维对调了（步长变成了 `[12, 2, 4, 1]`）！
+   这带来的结果是：逻辑上你想连续读取新形状下的前 6 个数，在物理内存里却得跳着读（先读下标 `0, 1`，再跳到 `4, 5`，再跳到 `8, 9`）。这种逻辑顺序与物理顺序不一致的状态，就叫**非连续内存（`is_contiguous = false`）**。
+3. **`.contiguous()`：按新的逻辑形状把物理内存重新排齐**
+   很多底层数学算子为了利用 CPU/GPU 的向量化指令，要求输入张量在物理内存里必须连续排列。调用 `.contiguous()` 后，程序会按 `[1, 2, 3, 2]` 的逻辑顺序把那 12 个数重新拷贝排齐，步长更新为规整的 `[12, 6, 2, 1]`，`is_contiguous` 重新恢复为 `true`。
 
-### 附：什么是广播（Broadcasting，`unsqueeze` + `expand`）？
+### 附：什么是维度插入（`unsqueeze`）与广播展开（`expand`）？
 
-在第零篇阶段 05 的分组查询注意力（GQA）里，我们有 9 个查询头，但只有 3 个键值头。为了让每 1 个键值头复制 3 份去配对 3 个查询头，我们在 `repeat_kv` 里写了三行代码：
-
-```rust
-// 假设输入 x 形状为 [B, h_kv, T, d_h]，例如 [1, 1, 3, 2]
-x.unsqueeze(2)?                            // 1. 在第 2 维插入一个长度为 1 的新轴 -> [1, 1, 1, 3, 2]
-    .expand((b, h_kv, n_rep, seq_len, d_h))? // 2. 将这个长度为 1 的轴零拷贝广播扩展为 n_rep=3 -> [1, 1, 3, 3, 2]
-    .reshape((b, h_kv * n_rep, seq_len, d_h)) // 3. 合并第 1 维和第 2 维 -> [1, 3, 3, 2]
-```
-
-这就是张量的**广播机制**：当某个维度的长度是 `1` 时，可以通过 `.expand(...)` 把它沿着该维度重复展开成任意长度 $N$，从而与另一个维度为 $N$ 的张量对齐运算。
+如果一个张量的形状是 `[1, 1, 3, 2]`（第 1 维长度只有 `1`），而我们需要把它沿着这一维复制 3 份变成 `[1, 3, 3, 2]`，可以分三步完成：
+1. `.unsqueeze(2)?`：在下标为 `2` 的位置插入一个长度为 `1` 的新维度，形状变为 `[1, 1, 1, 3, 2]`；
+2. `.expand((1, 1, 3, 3, 2))?`：将长度为 `1` 的维度广播（重复读取 3 次）为 `3`，形状变为 `[1, 1, 3, 3, 2]`；
+3. `.reshape((1, 3, 3, 2))?`：把中间两个维度 `1 × 3` 合并为 `3`，最终得到 `[1, 3, 3, 2]`。
 
 ---
 
-## 下半场：给 Python / C / JS 开发者的 Rust 与 `candle` 30 分钟速成
+## 六、 法则 6：两个核心数值函数——均方根归一化（RMSNorm）与 Softmax
 
-看完了上面的 5 条数学法则，你可能已经发现：Rust 写出来的张量代码和 Python（PyTorch / NumPy）长得有八成相似。下面我们把剩下的两成语法差异——也是新手读 Rust 源码最容易产生疑问的 **5 个核心语法点**——一次性扫清。
+除了加减乘除，数值计算中还有两个极其常用的非线性/归一化函数。我们用简单的数字手算一遍，彻底看清它们的公式。
 
----
+### 1. 均方根归一化（RMSNorm）：把向量的数值尺度拉回标准范围
 
-## 六、 语法 1：变量绑定 `let`、不可变默认规则与类型推导
+当一个向量经过多次矩阵乘法后，里面的数字可能会变得很大（比如几百）或很小（比如零点几）。为了防止数值爆炸，我们需要对向量 $\mathbf{v} = [v_1, v_2, \dots, v_d]$ 做**均方根归一化（Root Mean Square Normalization）**：
 
-在 [`src/model.rs`](../../crates/llm-tracer/src/model.rs) 里，你会看到两种声明变量的方式：
+1. **第一步（算均方根 RMS）**：把向量里每个数平方后求平均，再开根号（加上一个极小正数 $\epsilon = 10^{-5}$ 防止除以零）：
+   $$\text{RMS}(\mathbf{v}) = \sqrt{\frac{1}{d} \sum_{i=1}^{d} v_i^2 + \epsilon}$$
+2. **第二步（除以均方根并乘上缩放系数 $\gamma_i$）**：
+   $$\text{RMSNorm}(v_i) = \frac{v_i}{\text{RMS}(\mathbf{v})} \times \gamma_i$$
 
-```rust
-let d = cfg.hidden_size; // 不可变绑定：后面永远不能修改 d 的值
-let mut hidden = w_embed.index_select(&flat_ids, 0)?.reshape((b, seq_len, d))?; // 可变绑定 (mut)
+拿 `prelude.rs` 第六组实验里的向量 $\mathbf{v} = [1.0, 2.0, 3.0, 2.0]$（长度 $d=4$，缩放系数全为 $1.0$）手算验证：
+- 平方平均值 $= \frac{1^2 + 2^2 + 3^2 + 2^2}{4} = \frac{1 + 4 + 9 + 4}{4} = \frac{18}{4} = 4.5$；
+- 开根号得到均方根 $\text{RMS}(\mathbf{v}) = \sqrt{4.5} \approx \mathbf{2.12132}$；
+- 每个元素除以 $2.12132$：
+  $$[1.0, 2.0, 3.0, 2.0] \div 2.12132 \approx [\mathbf{0.4714}, \mathbf{0.9428}, \mathbf{1.4142}, \mathbf{0.9428}]$$
+
+### 2. Softmax 函数：把任意实数打分变成“加起来等于 1”的概率分布
+
+假设我们算出了三个候选项的原始得分 `[s_1, s_2, s_3]`（原始得分可以是正数、负数，甚至负无穷 $-\infty$）。怎么把它们变成一套非负且总和恰好等于 $1.0$（$100\%$）的权重比例？
+
+**Softmax** 分两步完成这件事：
+1. **第一步（取自然指数 $e^{s_i}$）**：因为指数函数 $e^x > 0$ 恒成立，任何负数经过 $e^x$ 都会变成正数；而且指数函数会放大差距，分高的变得更高。特别地，**如果某个位置的得分是负无穷 $-\infty$，那么 $e^{-\infty} = \mathbf{0}$！**
+2. **第二步（除以总和归一化）**：
+   $$\text{Softmax}(s_i) = \frac{e^{s_i}}{\sum_{j} e^{s_j}}$$
+
+拿 `prelude.rs` 里的得分向量 `[1.0, 1.0, -inf]` 手算验证：
+- 第一步取指数：$\left[e^{1.0}, e^{1.0}, e^{-\infty}\right] \approx [2.718, 2.718, \mathbf{0.0}]$；
+- 第二步除以总和（$2.718 + 2.718 + 0 = 5.436$）：得到 **`[0.5, 0.5, 0.0]`**！
+你看，把某个候选项的得分设为负无穷 `f32::NEG_INFINITY`（`-inf`），经过 Softmax 后它的权重就会干净利落地变成 **`0.0`**，剩下的候选项平分 $100\%$ 的权重。
+
+```text
+--- [6/6] RMS Normalization & Softmax ---
+  Input vector [1, 2, 3, 2] -> after RMSNorm: [0.47140402, 0.94280803, 1.414212, 0.94280803]
+  Scores [1.0, 1.0, -inf]   -> after Softmax: [0.5, 0.5, 0.0]
 ```
 
-1. **默认只读（Immutable by Default）**：
-   在 Rust 里，用 `let x = ...` 定义的变量**默认是只读常量**！如果后续代码不小心改了 `d`，编译器会直接报错。这在阅读长代码时极其省心：只要你看到一个变量声明时没有写 `mut`，你就百分之百确定它在整段函数里绝不会被任何地方偷偷篡改。
-2. **需要更新时显式加上 `mut`（Mutable）**：
-   像残差流主干张量 `hidden`，每穿过一层 Transformer 都要更新一次（`hidden = (&h_mid + &mlp_out)?;`），所以声明时必须显式写上 `let mut hidden = ...`。
-3. **自动类型推导与元组解构（Tuple Destructuring）**：
-   虽然 Rust 是强类型静态编译语言，但你几乎不需要手写繁琐的类型名，编译器会自动推导。同时它支持像 Python 一样一行解构元组：
-   ```rust
-   let (b, seq_len) = input_ids.dims2()?; // 将二维张量的形状直接解构为批大小 b 和序列长度 seq_len
-   ```
+---
+
+## 下半场：给 Python / C / JS 开发者的 Rust 与 `candle` 极简入门
+
+看完了上半场的 6 条数学法则，下半场我们用最短的时间把后续代码里用到的 **6 个 Rust 编程知识点** 讲清楚。
 
 ---
 
-## 七、 语法 2：所有权与借用——为什么张量相乘要写 `&gate * &up`？
+## 七、 语法 1：Rust 项目是怎么组织的？（`Cargo.toml`、`main.rs` 与 `lib.rs`）
 
-如果你以前写 Python 或 C++，看到下面这行代码一定会好奇——为什么两个张量相乘或相加，前面都要加一个取地址符（引用符）`&`？
+一个标准的 Rust 代码包（称为一个 **Crate**）目录结构非常干净：
 
-```rust
-let gated = (&gate * &up)?;
-let h_mid = (&hidden + &attn_out)?;
+```text
+my-project/
+├── Cargo.toml       # 项目的清单文件（声明包名、版本号与依赖库，类似 package.json 或 pyproject.toml）
+└── src/
+    ├── lib.rs       # 核心库入口：声明并导出各个功能模块（pub mod xxx;），存放单元测试
+    └── main.rs      # 命令行可执行程序入口：包含 fn main() 函数，调用 lib.rs 里的模块
 ```
 
-这背后就是 Rust 最著名的**所有权（Ownership）与借用（Borrowing）**机制。完全不用背概念，用一句话就能讲明白：
-
-- **如果直接传值 `func(x)`（不加 `&`）：交出所有权（Move）**
-  在 Rust 中，像 `Tensor`、`String`、`Vec` 这样管理着堆内存的对象，如果直接把变量名传给一个函数（或者直接写 `gate * up`），相当于**把变量的所有权移交给了对方**，用完就销毁了，下一行代码你就再也不能访问 `gate` 或 `hidden` 了！
-- **如果传不可变引用 `&x`（加上 `&`）：只读借用（Shared Borrow）**
-  在变量前加个 `&`（如 `&gate`、`&hidden`、`linear_no_bias(&x_norm, w_q)`），意思是：**“我只把数据的只读视图借给你看一眼/算一下，既不要在内存里复制整张大矩阵，算完之后也别销毁我的原张量，我后面还要接着用它呢！”**（例如 `hidden` 在算完 `x_norm` 后，还要留到阶段 06 做残差相加 `&hidden + &attn_out`）。
-- **如果传可变引用 `&mut x`：可写借用（Mutable Borrow）**
-  当一个函数不仅要读某个变量，还要往里面写入新数据时，就传 `&mut`。比如第零篇里 30 层的 KV Cache 槽位，每跑完一步都要把新算出的 $\mathbf{K}, \mathbf{V}$ 存进去，所以函数签名和调用处都显式标出了 `&mut kv_caches`——一眼就能看出哪个参数会被原地修改。
+- **`Cargo.toml`**：管理第三方依赖。当你运行 `cargo run`（编译并运行）或 `cargo test`（运行所有单元测试）时，`cargo` 工具会自动下载并编译 `Cargo.toml` 里声明的依赖库。
+- **`pub mod` 与 `use`**：在 `src/lib.rs` 里写一行 `pub mod ops;`，编译器就会自动去加载同目录下的 `src/ops.rs` 文件；其他文件想调用 `ops.rs` 里的公开函数（标有 `pub fn` 的函数）时，只需在文件开头写 `use crate::ops::函数名;` 即可。
 
 ---
 
-## 八、 语法 3：结构体 `struct`、枚举 `enum` 与模式匹配 `match`
+## 八、 语法 2：变量绑定 `let` vs `let mut`、基础数值类型与元组解构
 
-Rust 没有传统面向对象语言里复杂的类继承（`class A extends B`），它只用两个干净的数据结构来组织一切：**结构体（`struct`，把几个字段打包在一起）** 和 **枚举（`enum`，几个互斥选项里选一个）**。
+### 1. 默认只读（`let`）与显式可变（`let mut`）
 
-### 1. 结构体 `struct` 与方法块 `impl`
-
-打开 [`src/inspect.rs`](../../crates/llm-tracer/src/inspect.rs)，我们用 `struct LlamaConfig` 映射 `config.json` 里的超参数，再用 `impl LlamaConfig` 给它挂载成员方法：
+在 Python 或 JS 里，任何变量随时都能被重新赋值；但在 Rust 里，**用 `let` 声明的变量默认是只读的（Immutable）**：
 
 ```rust
-#[derive(Debug, Clone, Deserialize)] // 自动生成打印(Debug)、拷贝(Clone)和 JSON 反序列化代码
-pub struct LlamaConfig {
-    pub hidden_size: usize,         // d = 576
-    pub num_attention_heads: usize, // h_q = 9
-    // ...
+let rows = 3;
+// rows = 4; // 编译报错！默认不可修改
+
+let mut sum = 0; // 加上 mut (mutable) 关键字后，才允许后续修改该变量的值
+sum = sum + 10;  // 合法
+```
+
+这条规则在阅读数值计算代码时非常友好：只要你看到变量声明没有 `mut`，你就知道它在后续代码里绝不会被篡改；凡是声明了 `let mut x = ...` 的变量，一定会在后面的循环里被一步步更新。
+
+### 2. 四种最常用的数值类型
+
+在张量与数组代码中，你只会频繁见到以下 4 种基础数值类型：
+
+| Rust 类型名 | 含义 | 常见用途 |
+|---|---|---|
+| **`usize`** | 与当前 CPU 位数一致的无符号整数（64 位机器上为 64 位非负整数） | **数组长度、张量维度大小、循环下标**（如 `rows: usize = 5`） |
+| **`u32`** | 32 位无符号非负整数（范围 `0` 到约 `42 亿`） | 整数索引编号（如行号索引 `&[1u32, 2, 3]`） |
+| **`f32`** | 32 位单精度浮点数 | **张量内部的标准浮点数类型**（如 `1.0f32`） |
+| **`f64`** | 64 位双精度浮点数 | 高精度标量参数或缩放系数（如 `1e-5`） |
+
+需要在不同数值类型之间转换时，Rust 不会隐式转换，而是统一用 **`as` 关键字**显式转换，例如 `(rows as f64).sqrt()`。
+
+### 3. 元组解构（Tuple Destructuring）
+
+和 Python 一样，当一个函数返回多个值打包成的元组（Tuple）时，可以用一行 `let (a, b, c) = ...` 直接拆开：
+
+```rust
+// dims3() 返回三维张量的三个维度大小 (usize, usize, usize)
+let (batch, rows, cols) = tensor_3d.dims3()?;
+```
+
+---
+
+## 九、 语法 3：所有权（Ownership）与借用（Borrowing）——为什么要写 `&m1 * &m2`？
+
+初看 Rust 张量代码时，最容易产生疑问的地方就是变量名前面的取引用符号 **`&`**：
+
+```rust
+let elem_wise = (&m1 * &m2)?;
+let mat_mul = m1.matmul(&m2)?;
+```
+
+为什么不能像 Python 那样直接写 `m1 * m2` 或 `m1.matmul(m2)`，而非要在变量名前面加个 **`&`**？
+
+这源于 Rust 用来取代垃圾回收器（GC）的**所有权与借用规则**。用最通俗的话来说，把一个变量传给函数或运算符时，有三种传法：
+
+1. **不加 `&` 直接传值（如 `consume(m1)`）：移交所有权（Move）**
+   像 `Tensor`、`Vec`（动态数组）、`String` 这样在内存堆上分配了数据的对象，如果不加 `&` 直接传进去，代表**把 `m1` 的所有权彻底送给了对方**——那行代码执行完后，`m1` 就失效销毁了，下一行代码再想用 `m1` 就会编译报错！
+2. **加 `&` 传不可变引用（如 `&m1`、`&m2`）：只读借用（Shared Borrow）**
+   在变量前加 `&`，意思是：**“我只把 `m1` 的只读地址借给你读取计算，既不要在内存里复制整张矩阵，算完也别销毁我的 `m1`，我下一行还要接着用它！”**
+   这就是为什么我们在上面写 `(&m1 * &m2)?`——因为借用之后，`m1` 和 `m2` 毫发无损，下一行还能继续调用 `m1.matmul(&m2)?`。
+3. **加 `&mut` 传可变引用（如 `&mut buffer`）：可写借用（Mutable Borrow）**
+   如果被调用的函数需要往你传入的容器里写入或追加新数据，就传入 `&mut 变量名`。看到 `&mut`，你就立刻知道这个函数会原地修改该变量的内容。
+
+---
+
+## 十、 语法 4：结构体 `struct`、枚举 `enum`、模式匹配 `match` 与 `Option<T>`
+
+### 1. 用 `struct` 打包数据，用 `impl` 定义方法
+
+`struct`（结构体）用来把几个相关的字段打包成一个类型，`impl`（实现块）用来给这个类型添加方法：
+
+```rust
+#[derive(Debug, Clone)] // 让编译器自动生成调试打印 {:?} 和 .clone() 复制能力
+pub struct MatrixConfig {
+    pub rows: usize,
+    pub cols: usize,
 }
 
-impl LlamaConfig {
-    // &self 相当于 Python 里的 self 或 C++/Java 里的 this
-    // 注意函数最后一行不加分号 (;)，代表直接把这行算出的值作为函数返回值！
-    pub fn head_dim(&self) -> usize {
-        self.hidden_size / self.num_attention_heads
+impl MatrixConfig {
+    // &self 代表对当前结构体实例的只读借用（相当于 Python 的 self）
+    // 注意：函数最后一行如果不写分号 (;)，这行表达式的值就会直接作为函数返回值！
+    pub fn total_elements(&self) -> usize {
+        self.rows * self.cols
     }
 }
 ```
 
-这里顺带记住 Rust 的一个贴心简写：**函数里最后一行表达式如果不写分号 `;`，它就是这个函数的返回值**（等同于写了 `return self.hidden_size / self.num_attention_heads;`）。
+### 2. 用 `enum` 和 `match` 表达多选一分支，用 `Option<T>` 告别空指针
 
-### 2. 枚举 `enum`、模式匹配 `match` 与 `Option<T>`
-
-打开 [`src/ops.rs`](../../crates/llm-tracer/src/ops.rs)，我们定义了张量的三种角色 `Role`，并用 `match`（加强版的 `switch-case`，编译器会强制检查你有没有漏掉任何一个分支）把它转成打印标签：
+`enum`（枚举）用来表示“几个固定选项里选一个”，配合 `match`（模式匹配）做分支处理：
 
 ```rust
-pub enum Role {
-    Weight,     // 静态权重
-    Activation, // 动态激活
-    KvCache,    // 键值缓存
+pub enum TensorKind {
+    StaticTable,
+    DynamicArray,
 }
 
-let role_tag = match role {
-    Role::Weight     => "WEIGHT    ",
-    Role::Activation => "ACTIVATION",
-    Role::KvCache    => "KV_CACHE  ",
+let label = match kind {
+    TensorKind::StaticTable  => "STATIC ",
+    TensorKind::DynamicArray => "DYNAMIC",
 };
 ```
 
-更重要的是，**Rust 语言里没有 `null` / `None` 空指针异常！**
-当一个槽位“可能装了数据，也可能还是空的”——比如第 1 轮 Prefill 开始前，每一层的 KV Cache 还是空的；第 2 轮 Decode 时，里面已经有上一轮存好的 `(prev_k, prev_v)` 了——Rust 使用标准库内置的枚举 **`Option<T>`**，它只有两个分支：
-- `Some(数据)`：槽位里有东西；
-- `None`：槽位目前是空的。
+在很多语言里，一个变量可能为空（`null` / `None`），一旦忘了判空就会触发臭名昭著的空指针崩溃。**Rust 语言里根本没有 `null`！**
+当一个位置“可能存了数据 `T`，也可能是空的”时，Rust 强制使用标准库内置的枚举 **`Option<T>`**，它只有两个变体：
+- **`Some(v)`**：里面装着有效数据 `v`；
+- **`None`**：当前是空的。
 
-回头看 [`src/model.rs`](../../crates/llm-tracer/src/model.rs) 里更新 KV Cache 的那 5 行代码，现在是不是像读白话文一样清楚？
+当你从 `Option<T>` 里取数据时，必须用 `match` 把“有数据（`Some`）”和“没数据（`None`）”两种情况都交代清楚，编译器才允许通过：
 
 ```rust
-// kv_slot.take() 把槽位里的 Option<(Tensor, Tensor)> 取出来：
-let (k_cache, v_cache) = match kv_slot.take() {
-    // 如果里面已经有历史缓存 Some((prev_k, prev_v))，就把新算出的 k_rope/v 拼在历史缓存后面（第 2 维）
-    Some((prev_k, prev_v)) => (
-        Tensor::cat(&[&prev_k, &k_rope], 2)?,
-        Tensor::cat(&[&prev_v, &v], 2)?,
-    ),
-    // 如果槽位是空的 (None)，说明现在是第 1 轮 Prefill，直接拿当前的 k_rope 和 v 当作初始缓存
-    None => (k_rope, v),
+// 假设 cache_slot 的类型是 Option<Tensor>
+let updated_tensor = match cache_slot.take() {
+    Some(prev_tensor) => Tensor::cat(&[&prev_tensor, &new_tensor], 0)?, // 以前有数据：拼接起来
+    None => new_tensor,                                                 // 以前是空的：直接用新数据
 };
 ```
 
 ---
 
-## 九、 语法 4：错误处理 `Result<T>` 与行尾那个神出鬼没的问号 `?`
+## 十一、 语法 5：错误处理 `Result<T>` 与行尾的问号运算符 `?`
 
-初看本系列代码时，你一定会问：**为什么几乎每一行张量计算的末尾，都在小括号后面跟着一个问号 `?`？**
+在读本系列代码时，你会发现几乎每一行张量操作的末尾都有一个问号 **`?`**：
 
 ```rust
-let q_lin = linear_no_bias(&x_norm, w_q)?;
-let q = q_lin.reshape((b, seq_len, h_q, d_h))?.transpose(1, 2)?.contiguous()?;
+let w_t = w.t()?;
+let out_2d = picked_2d.matmul(&w_t)?;
 ```
 
-在张量计算中，随时可能因为形状不匹配、文件不存在或维度越界而出错。Rust 没有采用 Python/Java 那种容易在半路突然崩溃跳出的 `try / catch` 异常机制，而是让所有可能出错的函数都返回一个枚举类型 **`Result<成功值类型>`**，它也只有两个分支：
-- `Ok(运算结果)`：计算成功，里面包着算出来的 `Tensor`；
-- `Err(错误原因)`：计算出错，里面包着详细的报错信息（比如哪两个维度没对齐）。
+这个 **`?`** 到底是什么？
+在矩阵运算中，随时可能因为“两个矩阵维度对不上”或“文件读取失败”而报错。Rust 不使用 `try / catch` 抛出异常，而是让所有可能失败的函数返回一个 **`Result<成功类型>`** 枚举：
+- 如果执行成功，返回 **`Ok(结果值)`**（比如 `Ok(Tensor)`）；
+- 如果执行失败，返回 **`Err(错误信息)`**。
 
-如果每次调函数都要手写 `match` 去拆开 `Ok` 和 `Err`，代码就会变得又臭又长。于是 Rust 发明了极其优雅的**问号运算符 `?`**：
-- 当你在返回 `Result` 的函数调用后面加一个 **`?`** 时：
-  - 如果结果是 **`Ok(val)`**，`?` 会自动剥掉外壳，把里面的 `val`（比如 `Tensor`）取出来赋给左边的变量，继续往下走；
-  - 如果结果是 **`Err(e)`**，`?` 会立刻中止当前函数，把错误 `Err(e)` 原封不动地向上抛给调用者！
+在函数调用末尾加上一个问号 **`?`**，是 Rust 提供的语法糖，它会自动帮你做两件事：
+1. 如果函数返回的是 **`Ok(val)`**，`?` 会自动剥开 `Ok` 外壳，把里面的 `val`（即真正的 `Tensor`）取出来赋给左边的变量，继续执行下一行；
+2. 如果函数返回的是 **`Err(e)`**，`?` 会立即停止当前函数的执行，把错误 `Err(e)` 原封不动地向上返回给调用者。
 
-也就是说，行尾那一个小小的 **`?`**，等于一行代码帮你写完了“如果成功就拆包取值，如果失败就立刻带着错误退出函数”的全部安全检查。
+有了 **`?`**，我们的矩阵计算代码既能保持像 Python 一样干净紧凑（一行一个公式），又具备完整的编译期错误处理保障。
 
 ---
 
-## 十、 语法 5：迭代器链 `.map().collect()` 与 PyTorch / `candle` 算子对照表
+## 十二、 语法 6：切片、迭代器 `.map().collect()` 与 `candle` 常用 API 速查表
 
-### 1. 一行代码生成数组：`(0..half).map(...).collect()`
+### 1. 动态数组 `Vec<T>`、切片 `&[T]` 与迭代器链
 
-在 Python 里，我们经常写列表推导式（List Comprehension），比如：
-```python
-# Python 列表推导式：生成 [0.0, 1.0, 2.0, ..., max_seq_len - 1]
-positions = [float(p) for p in range(max_seq_len)]
-```
-
-在 Rust 中，完全等价的写法是**范围（`0..n`）+ 映射闭包（`.map(|参数| 表达式)`）+ 收集为数组（`.collect()`）**。看 [`src/ops.rs`](../../crates/llm-tracer/src/ops.rs) 里生成 RoPE 位置序列和逆频率表的代码：
+在 Rust 中：
+- 固定或借用的一段连续数组视图写作 **`&[1.0f32, 2.0, 3.0]`**（称为切片 Slice）；
+- 可动态增长的数组写作 **`Vec<f32>`**，可以用 `vec![0.0f32; 10]` 快速创建一个包含 10 个 `0.0` 的数组；
+- 当你想按公式批量生成一串数字（类似 Python 的列表推导式 `[float(i) for i in range(n)]`）时，Rust 使用 **`(0..n).map(|i| ...).collect()`**：
 
 ```rust
-// 0..max_seq_len 相当于 Python 的 range(max_seq_len)
-// |p| p as f32 是匿名函数（闭包），相当于 Python 的 lambda p: float(p)
-// .collect() 把流式算出的每个元素打包进 Vec<f32> 动态数组里
-let positions: Vec<f32> = (0..max_seq_len).map(|p| p as f32).collect();
+// 0..4 生成整数序列 0, 1, 2, 3
+// .map(|i| (i * 2) as f32) 把每个整数 i 映射为浮点数 0.0, 2.0, 4.0, 6.0
+// .collect() 把结果收集进 Vec<f32> 数组
+let even_floats: Vec<f32> = (0..4).map(|i| (i * 2) as f32).collect();
 ```
 
-### 2. PyTorch / NumPy vs. Rust `candle-core` 常用张量 API 一览表
+### 2. Python (NumPy / PyTorch) vs. Rust `candle-core` 张量算子速查表
 
-最后，我们把第零篇全部 600 行源码中调用过的 `candle` 张量方法整理成一张速查表。只要你用过 NumPy 或 PyTorch，看一眼就能直接对应上：
+最后，我们将接下来最常用的 15 个张量操作整理成对照表，方便你在阅读代码时随时查阅：
 
-| 操作目的 | Python (PyTorch) 写法 | Rust (`candle-core` / `candle-nn`) 写法 | 在第零篇哪里用到？ |
+| 操作功能 | Python (PyTorch / NumPy) | Rust (`candle-core` / `candle-nn`) | 说明 |
 |---|---|---|---|
-| **从数组创建张量** | `torch.tensor(slice).reshape(5, 4)` | `Tensor::from_slice(&slice, (5, 4), dev)?` | `prelude.rs`、`toy.rs`、`model.rs` |
-| **查看张量形状** | `x.shape` | `x.dims()`（或拆解三维 `x.dims3()?`） | 全文各阶段维度校验 |
-| **转换浮点精度** | `v.to(torch.float32)` | `v.to_dtype(DType::F32)?` | `inspect.rs` 将 BF16 权重转为 F32 |
-| **按行号查表** | `w_embed[flat_ids]` 或 `F.embedding` | `w_embed.index_select(&flat_ids, 0)?` | **阶段 02**：Token ID 查词嵌入表 |
-| **改变形状 (零拷贝)** | `x.reshape(b, seq_len, h, d_h)` | `x.reshape((b, seq_len, h, d_h))?` | **阶段 04/06**：拆头与合并多头 |
-| **交换最后两维 (转置)** | `w.T` 或 `k.transpose(-2, -1)` | `w.t()?` 或 `k_full.t()?` | **阶段 04/05**：权重转置与 $\mathbf{Q}\mathbf{K}^\top$ |
-| **交换指定两维** | `q.transpose(1, 2)` | `q.transpose(1, 2)?` | **阶段 04/06**：将头数维度 `h` 提前或还原 |
-| **整理物理内存连续性** | `q.contiguous()` | `q.contiguous()?` | **阶段 04/06**：`transpose(1, 2)` 之后调用 |
-| **矩阵乘法 (MatMul)** | `a @ b` 或 `torch.matmul(a, b)` | `a.matmul(&b)?` | 所有线性层投影、注意力得分与加权求和 |
-| **逐元素运算** | `gate * up`、`hidden + attn_out` | `(&gate * &up)?`、`(&hidden + &attn_out)?` | **阶段 06/07**：残差相加与 SwiGLU 门控 |
-| **沿指定维度切片** | `cos_all[offset : offset + seq_len]` | `cos_all.narrow(0, offset, seq_len)?` | **阶段 03**：切出当前位置的 RoPE 旋转表 |
-| **沿指定维度拼接** | `torch.cat([prev_k, k_rope], dim=2)` | `Tensor::cat(&[&prev_k, &k_rope], 2)?` | **阶段 05 / 第十节**：追加拼接 KV Cache |
-| **插入维度与广播展开** | `x.unsqueeze(2).expand(...)` | `x.unsqueeze(2)?.expand(...)` | **阶段 05**：GQA `repeat_kv` 键值头广播 |
-| **取单个下标切片** | `logits[0, seq_len - 1]` | `logits.i((0, seq_len - 1))?` | **阶段 10**：取出最后一个词的 49152 维得分 |
-| **求最大值下标** | `last_logits.argmax(dim=0).item()` | `last_logits.argmax(0)?.to_scalar::<u32>()?` | **阶段 10**：贪心选出得分最高的下一个词号 |
+| **从数组创建张量** | `torch.tensor(data).reshape(5, 4)` | `Tensor::from_slice(&data, (5, 4), dev)?` | 将一维数组按指定形状加载为张量 |
+| **创建全 0 / 全 1 张量** | `torch.zeros((2, 3))` / `torch.ones((4,))` | `Tensor::zeros((2, 3), DType::F32, dev)?` | 创建指定形状的常数张量 |
+| **查看张量形状** | `x.shape` | `x.dims()` 或 `x.dims3()?` | `dims()` 返回维度数组，`dims3()` 直接解构三维 |
+| **转换数据类型** | `x.to(torch.float32)` | `x.to_dtype(DType::F32)?` | 将 16 位浮点数等转换为 32 位浮点数 `f32` |
+| **按索引号抽行** | `table[row_indices]` | `table.index_select(&row_indices, 0)?` | 沿第 `0` 维（行）抽出指定行号的数据 |
+| **重塑形状 (零拷贝)** | `x.reshape(1, 3, 4)` | `x.reshape((1, 3, 4))?` | 不改变元素总数，仅改变维度划分方式 |
+| **全部展平为一维** | `x.flatten()` | `x.flatten_all()?` | 将任意多维张量展平为一维向量 |
+| **二维转置 (交换最后两维)** | `w.T` | `w.t()?` | 将 `[M, N]` 转置为 `[N, M]` |
+| **交换任意两个维度** | `x.transpose(1, 2)` | `x.transpose(1, 2)?` | 交换第 `1` 维与第 `2` 维 |
+| **整理物理内存连续性** | `x.contiguous()` | `x.contiguous()?` | 将转置后的非连续张量在物理内存中重新排齐 |
+| **矩阵乘法 (MatMul)** | `a @ b` 或 `torch.matmul(a, b)` | `a.matmul(&b)?` | `[M, K] × [K, N] -> [M, N]` |
+| **逐元素加 / 乘** | `a + b` / `a * b` | `(&a + &b)?` / `(&a * &b)?` | 相同形状张量对应位置相加或相乘 |
+| **沿指定维度切取子区间** | `x[offset : offset + len]` | `x.narrow(0, offset, len)?` | 沿第 `0` 维从 `offset` 开始切出长度为 `len` 的一段 |
+| **沿指定维度拼接张量** | `torch.cat([a, b], dim=2)` | `Tensor::cat(&[&a, &b], 2)?` | 沿第 `2` 维将两个张量首尾拼接 |
+| **求最大值所在下标** | `v.argmax(dim=0).item()` | `v.argmax(0)?.to_scalar::<u32>()?` | 找出向量中数值最大的元素下标并转为 `u32` 整数 |
 
 ---
 
-## 十一、 兵器已备齐，准备进入大模型内部！
+## 小结
 
-恭喜你！到这里，你已经拿齐了拆解大模型所需的全部数学与代码武器：
-- 在数学上，你知道了张量维度怎么一层层剥开，知道了点积为什么能测相似度，记住了矩阵乘法 `[M, K] × [K, N] -> [M, N]` 的消维铁律和 `.t()` 转置约定，分清了 `matmul` 与逐元素 `*`，也看懂了 `reshape`、`transpose(1, 2)` 和 `.contiguous()` 在一维物理内存上的真实动作；
-- 在 Rust 语法上，你认识了 `let / let mut`、`&` 只读借用与 `&mut` 可变借用、`struct / enum / match`、处理空槽位的 `Option`、处理报错的 `Result` 与 `?` 运算符，以及 `candle-core` 的常用算子。
+到这里，我们已经把多维矩阵运算的 **6 条数学法则**（张量形状与按行检索、向量点积相似度、矩阵乘法消维与转置、逐元素乘法、内存步长与广播、RMSNorm 与 Softmax）和 **6 个 Rust 核心语法**（项目结构、`let/mut` 与数值类型、`&` 借用规则、`struct/enum/match/Option`、`Result` 与 `?` 运算符、以及 `candle` 张量 API）全部梳理完毕。
 
-现在，打开 **[《第零篇｜一次大语言模型推理的完整旅程：从输入文本到下一个 Token》](../ep00-inference-journey/draft.md)**，我们正式把真实的大语言模型装上解剖台！
+准备好这两件基础工具后，接下来就可以正式进入 **[《第零篇｜一次大语言模型推理的完整旅程：从输入文本到下一个 Token》](../ep00-inference-journey/draft.md)** 了！
