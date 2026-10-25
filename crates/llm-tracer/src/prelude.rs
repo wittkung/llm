@@ -145,19 +145,32 @@ pub fn run_prelude_sandbox(dev: &Device) -> Result<()> {
     // [6/6] RMS Normalization & Softmax (with -inf masking)
     // -------------------------------------------------------------------------
     println!("\n--- [6/6] RMS Normalization & Softmax ---");
-    let v = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 2.0], (1, 1, 4), dev)?;
     let scale = Tensor::ones((4,), candle_core::DType::F32, dev)?;
-    let v_rms = candle_nn::ops::rms_norm(&v, &scale, 1e-5)?;
+    let v_normal = Tensor::from_slice(&[2.0f32, -4.0, 4.0, 8.0], (1, 1, 4), dev)?;
+    let v_huge = Tensor::from_slice(&[200.0f32, -400.0, 400.0, 800.0], (1, 1, 4), dev)?;
+    let rms_normal = candle_nn::ops::rms_norm(&v_normal, &scale, 1e-5)?;
+    let rms_huge = candle_nn::ops::rms_norm(&v_huge, &scale, 1e-5)?;
     println!(
-        "  Input vector [1, 2, 3, 2] -> after RMSNorm: {:?}",
-        v_rms.flatten_all()?.to_vec1::<f32>()?
+        "  v_normal [2, -4, 4, 8]         (RMS = 5)   -> RMSNorm: {:?}",
+        rms_normal.flatten_all()?.to_vec1::<f32>()?
+    );
+    println!(
+        "  v_huge   [200, -400, 400, 800] (RMS = 500) -> RMSNorm: {:?}",
+        rms_huge.flatten_all()?.to_vec1::<f32>()?
     );
 
-    let scores = Tensor::from_slice(&[1.0f32, 1.0, f32::NEG_INFINITY], (1, 3), dev)?;
-    let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+    let scores_a = Tensor::from_slice(&[1.0f32, 2.0, 3.0], (1, 3), dev)?;
+    let probs_a = candle_nn::ops::softmax_last_dim(&scores_a)?;
     println!(
-        "  Scores [1.0, 1.0, -inf]   -> after Softmax: {:?}",
-        probs.flatten_all()?.to_vec1::<f32>()?
+        "  Scores [1.0, 2.0, 3.0]  -> Softmax: {:?}",
+        probs_a.flatten_all()?.to_vec1::<f32>()?
+    );
+
+    let scores_b = Tensor::from_slice(&[1.0f32, 1.0, f32::NEG_INFINITY], (1, 3), dev)?;
+    let probs_b = candle_nn::ops::softmax_last_dim(&scores_b)?;
+    println!(
+        "  Scores [1.0, 1.0, -inf] -> Softmax: {:?}",
+        probs_b.flatten_all()?.to_vec1::<f32>()?
     );
 
     Ok(())
