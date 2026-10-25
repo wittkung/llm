@@ -90,37 +90,55 @@ pub fn run_prelude_sandbox(dev: &Device) -> Result<()> {
     println!("  Matrix mult (m1.matmul)    [2, 2]: {:?}", mat_mul.to_vec2::<f32>()?);
 
     // -------------------------------------------------------------------------
-    // [5/6] Memory Layout: reshape, transpose, stride,contiguous, and expand
+    // [5/6] Reshape (Grouping), Transpose (Swapping Hierarchy), & Contiguous
     // -------------------------------------------------------------------------
-    println!("\n--- [5/6] Memory Strides (reshape vs. transpose vs. contiguous) & Broadcast ---");
-    let reshaped = tensor_3d.reshape((1, 3, 2, 2))?;
-    let transposed = reshaped.transpose(1, 2)?;
+    println!("\n--- [5/6] Reshape, Transpose & Contiguous (3 Students x 4 Courses) ---");
+    // 3 students, 4 courses each (tens digit = student 1..3, ones digit = course 1..4)
+    // Courses 1,2 = Arts group; Courses 3,4 = Science group
+    let scores_2d = Tensor::from_slice(
+        &[
+            11.0f32, 12.0, 13.0, 14.0, // Student 1
+            21.0, 22.0, 23.0, 24.0, // Student 2
+            31.0, 32.0, 33.0, 34.0, // Student 3
+        ],
+        (3, 4),
+        dev,
+    )?;
+    println!("  1. Original [3, 4] (3 students, 4 courses):");
+    println!("     {:?}", scores_2d.to_vec2::<f32>()?);
+
+    // Step A: reshape [3, 4] -> [3, 2, 2] (3 students, each split into 2 groups of 2 courses)
+    let reshaped = scores_2d.reshape((3, 2, 2))?;
+    println!(
+        "  2. After reshape(3, 2, 2) [3 students, 2 groups, 2 courses] (is_contiguous = {}):",
+        reshaped.is_contiguous()
+    );
+    println!("     {:?}", reshaped.to_vec3::<f32>()?);
+
+    // Step B: transpose(0, 1) -> [2, 3, 2] (Swap outer hierarchy to: 2 groups, 3 students, 2 courses)
+    let transposed = reshaped.transpose(0, 1)?;
+    println!(
+        "  3. After transpose(0, 1)  [2 groups, 3 students, 2 courses] (is_contiguous = {}):",
+        transposed.is_contiguous()
+    );
+    println!("     Group 0 (Arts    for all 3 students): {:?}", transposed.i(0)?.to_vec2::<f32>()?);
+    println!("     Group 1 (Science for all 3 students): {:?}", transposed.i(1)?.to_vec2::<f32>()?);
+
+    // Step C: .contiguous() physically reorders memory to match the new [2, 3, 2] grouping
     let contiguous = transposed.contiguous()?;
     println!(
-        "  After reshape [1, 3, 2, 2]      : is_contiguous = {:<5} | strides = {:?}",
-        reshaped.is_contiguous(),
-        reshaped.stride()
+        "  4. After .contiguous()    [2, 3, 2] (is_contiguous = {}):",
+        contiguous.is_contiguous()
     );
-    println!(
-        "  After transpose(1, 2) [1, 2, 3, 2]: is_contiguous = {:<5} | strides = {:?}",
-        transposed.is_contiguous(),
-        transposed.stride()
-    );
-    println!(
-        "  After .contiguous()   [1, 2, 3, 2]: is_contiguous = {:<5} | strides = {:?}",
-        contiguous.is_contiguous(),
-        contiguous.stride()
-    );
+    println!("     Flattened physical order: {:?}", contiguous.flatten_all()?.to_vec1::<f32>()?);
 
-    let slice_one = contiguous.narrow(1, 0, 1)?; // [1, 1, 3, 2]
-    let expanded = slice_one
-        .unsqueeze(2)?
-        .expand((1, 1, 3, 3, 2))?
-        .reshape((1, 3, 3, 2))?;
+    // Step D: Broadcast expand (repeat Group 0 three times along a new axis)
+    let group0 = contiguous.narrow(0, 0, 1)?; // [1, 3, 2]
+    let repeated = group0.unsqueeze(1)?.expand((1, 3, 3, 2))?.reshape((3, 3, 2))?;
     println!(
-        "  Broadcast expand: {:?} repeated 3x along axis -> {:?}",
-        slice_one.dims(),
-        expanded.dims()
+        "  5. Broadcast expand: {:?} repeated 3x -> {:?}",
+        group0.dims(),
+        repeated.dims()
     );
 
     // -------------------------------------------------------------------------
