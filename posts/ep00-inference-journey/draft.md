@@ -4,7 +4,7 @@
 
 今天我们将把这一切讲明白。作为整套系列的**第零篇（总览篇）**，我们基于 **Rust 工具链**，以开源模型 **`SmolLM2-135M-Instruct`**（标准 Llama 仅解码器架构，1.35 亿参数、共 272 个权重张量、单文件 269 MB，普通笔记本 CPU 即可毫秒级运行）为例，走通一次完整前向计算的 11 个阶段；在文章后半部分，我们还将横向对比目前最前沿的工业级大模型——如 **`DeepSeek-V4.1-Flash-1017`**——看看最先进的架构与今天所学的基准模型究竟有什么区别。
 
-别担心，你不需要 Rust 基础，只需要有基本的编程直觉和基础的线性代数知识即可。
+别担心，你不需要深厚的 Rust 功底，只需要有基本的编程直觉和基础的线性代数知识即可。如果你对矩阵乘法的维度消去规律还不熟，或者此前从未接触过 Rust，可以先花 20 分钟阅读专门为你准备的 **[《前置篇｜拆解大模型前的两件趁手兵器：张量线性代数与 Rust 极简入门》](../ep-pre-math-and-rust/draft.md)**。
 
 本文的配套 GitHub 仓库链接在这：[https://github.com/wittkung/llm](https://github.com/wittkung/llm)，可以克隆或下载代码自己跑跑看！
 
@@ -353,15 +353,16 @@ llm/                                   # 配套仓库根目录
     └── llm-tracer/                    # 本篇的白盒探针代码包 (Crate)
         ├── Cargo.toml                 # 探针包的依赖声明文件（继承顶层工作区配置）
         └── src/                       # 按生产级 Rust 规范与本文阅读进度拆分的源码模块：
-            ├── main.rs                #   [55 行]  二进制命令行入口：解析 --mode 参数并调用核心库
-            ├── lib.rs                 #   [108 行] 核心库导出根 (Library Root) + 自动化单元测试套件
+            ├── main.rs                #   [59 行]  二进制命令行入口：解析 --mode 参数并调用核心库
+            ├── lib.rs                 #   [62 行]  核心库导出根 (Library Root) + 自动化单元测试套件
+            ├── prelude.rs             #   [99 行]  对应前置篇 (--mode prelude)：5 条张量与线性代数法则演练沙盒
             ├── inspect.rs             #   [139 行] 对应第二节 (--mode inspect)：读取配置并核验 272 个权重张量
             ├── toy.rs                 #   [83 行]  对应第六节 (--mode toy)：用 3x4 玩具矩阵验证纸笔手算结果
             ├── ops.rs                 #   [104 行] 对应第九节：trace 打印器 + 5 个核心数学算子
             └── model.rs               #   [249 行] 对应第九、十节 (--mode real)：11 阶段完整前向推理与 KV Cache 循环
 ```
 
-为了让第一次接触 Rust 的读者既能轻松读懂全部源码，又能从第一天起接触工业级 Rust 项目的标准写法，我们的代码组织遵循了四项生产级工程规范，并按本文的阅读顺序把 `crates/llm-tracer/src/` 拆成了职责单一的小模块（每个文件只有 55 到 249 行）：
+为了让第一次接触 Rust 的读者既能轻松读懂全部源码，又能从第一天起接触工业级 Rust 项目的标准写法，我们的代码组织遵循了四项生产级工程规范，并按本文的阅读顺序把 `crates/llm-tracer/src/` 拆成了职责单一的小模块（每个文件只有 59 到 249 行）：
 
 - **规范 1：薄二进制入口 + 核心库分离（`main.rs` + `lib.rs`）**：在生产级 Rust 项目中，`src/main.rs` 只负责解析命令行参数，绝不堆放业务逻辑；真正的算法模块全部由 `src/lib.rs` 导出。这样既能在 `lib.rs` 中直接运行 `cargo test` 自动化单元测试，也允许后续篇章的代码包直接复用本篇写好的算子。
 - **规范 2：工作区依赖与安全门禁集中管理（Workspace Lints & Dependencies）**：顶层 `Cargo.toml` 统一锁定依赖版本，开启 `unsafe_code = "forbid"`（全库禁止不安全裸指针）与 `clippy` 静态检查，并配置 `[profile.dev.package."*"] opt-level = 3`（让底层矩阵库在开发调试模式下也开启最高级别 `-O3` 编译优化，兼顾秒级编译与真机推理速度）。
@@ -371,7 +372,8 @@ llm/                                   # 配套仓库根目录
 
 | 源码文件 | 行数 | 对应本文章节与运行命令 | 这个文件里写了什么（读到对应章节时打开它即可） |
 |---|---|---|---|
-| **`src/main.rs` & `src/lib.rs`** | 55 行 / 108 行 | 全局入口与测试（`cargo test`） | `main.rs` 定义 `--mode inspect / toy / real` 命令行开关并定位模型目录；`lib.rs` 挂载四大业务模块并包含算子单元测试 |
+| **`src/main.rs` & `src/lib.rs`** | 59 行 / 62 行 | 全局入口与测试（`cargo test`） | `main.rs` 定义 `--mode prelude / inspect / toy / real` 命令行开关并定位模型目录；`lib.rs` 挂载业务模块并包含算子单元测试 |
+| **`src/prelude.rs`** | 99 行 | **[前置篇](../ep-pre-math-and-rust/draft.md)**（`cargo run -- --mode prelude`） | 用 5 组极简矩阵演练张量查表、向量点积、矩阵乘法与转置、逐元素门控、以及 `reshape / transpose / contiguous` 步长变化 |
 | **`src/inspect.rs`** | 139 行 | **第二节**（`cargo run -- --mode inspect`） | 定义 `LlamaConfig` 结构体（映射 `config.json`）、`load_config_and_weights` 权重加载函数、`get_tensor` 安全查表与 `run_inspect` 体检函数 |
 | **`src/toy.rs`** | 83 行 | **第六节**（`cargo run -- --mode toy`） | 将第六节 $B=1, T=3, d=4$ 的纸笔手算矩阵原样写成代码，核验两个注意力头的概率分布与拼接输出 |
 | **`src/ops.rs`** | 104 行 | **第九节**（基础算子库） | 存放 `trace` 白盒打印函数，以及整座模型仅需的 **5 个数学算子**（线性投影、RMSNorm、RoPE 频率表、GQA 键值复制、上三角因果掩码） |

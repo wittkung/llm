@@ -9,6 +9,7 @@
 pub mod inspect;
 pub mod model;
 pub mod ops;
+pub mod prelude;
 pub mod toy;
 
 pub use inspect::LlamaConfig;
@@ -17,8 +18,15 @@ pub use ops::{trace, Role};
 #[cfg(test)]
 mod tests {
     use crate::ops::{apply_causal_mask, linear_no_bias, repeat_kv};
+    use crate::prelude::run_prelude_sandbox;
     use crate::toy::run_toy_verification;
     use candle_core::{Device, Tensor};
+
+    #[test]
+    fn test_prelude_sandbox_runs_cleanly() {
+        let dev = Device::Cpu;
+        run_prelude_sandbox(&dev).expect("Prelude sandbox should succeed");
+    }
 
     #[test]
     fn test_toy_verification_runs_cleanly() {

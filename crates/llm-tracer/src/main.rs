@@ -1,11 +1,13 @@
 use anyhow::Result;
 use candle_core::Device;
 use clap::{Parser, ValueEnum};
-use llm_tracer::{inspect, model, toy};
+use llm_tracer::{inspect, model, prelude, toy};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Mode {
+    /// Mode 0 (Prelude): Run the 5 interactive Linear Algebra & Tensor examples
+    Prelude,
     /// Mode 1 (Section 2): Inspect the 272 parameter tensors of SmolLM2-135M-Instruct
     Inspect,
     /// Mode 2 (Section 6): Verify the hand-calculated Toy MHA example (B=1, T=3, d=4, h=2, d_h=2)
@@ -17,7 +19,7 @@ pub enum Mode {
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
-    /// Execution mode: `inspect`, `toy`, or `real`
+    /// Execution mode: `prelude`, `inspect`, `toy`, or `real`
     #[arg(long, value_enum, default_value_t = Mode::Inspect)]
     mode: Mode,
 
@@ -48,6 +50,7 @@ fn main() -> Result<()> {
     let dev = Device::Cpu;
     let model_dir = resolve_model_dir(args.model_dir.as_deref());
     match args.mode {
+        Mode::Prelude => prelude::run_prelude_sandbox(&dev)?,
         Mode::Inspect => inspect::run_inspect(&model_dir, &dev)?,
         Mode::Toy => toy::run_toy_verification(&dev)?,
         Mode::Real => model::run_real_trace(&model_dir, &dev)?,
