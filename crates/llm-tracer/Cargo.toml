@@ -1,0 +1,18 @@
+[package]
+name = "llm-tracer"
+version = "0.1.0"
+edition = "2021"
+description = "White-box LLM tensor & forward-pass tracer for Episode 0 (Toy MHA + Real SmolLM2/Qwen2.5)"
+
+[dependencies]
+anyhow = "1.0"
+candle-core = "0.8"
+candle-nn = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.8", features = ["accelerate"] }
+candle-nn = { version = "0.8", features = ["accelerate"] }

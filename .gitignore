@@ -1,0 +1,8 @@
+# Rust build artifacts (workspace root or sub-crates)
+target/
+
+# Downloaded model weights and files (fetched via curl)
+/models/
+
+# macOS system files
+.DS_Store
