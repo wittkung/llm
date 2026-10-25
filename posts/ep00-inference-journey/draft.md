@@ -343,7 +343,7 @@ curl.exe -L "$BASE_URL/model.safetensors" -o models\SmolLM2-135M-Instruct\model.
 
 ```text
 llm/                                   # 配套仓库根目录
-├── Cargo.toml                         # 顶层工作区清单 (Workspace Cargo.toml)
+├── Cargo.toml                         # 顶层工作区清单 (Workspace Cargo.toml：统一管理依赖版本、Lint 与编译优化)
 ├── models/
 │   └── SmolLM2-135M-Instruct/         # 刚刚下载的三个模型文件存放处
 │       ├── config.json
@@ -351,44 +351,126 @@ llm/                                   # 配套仓库根目录
 │       └── model.safetensors
 └── crates/
     └── llm-tracer/                    # 本篇的白盒探针代码包 (Crate)
-        ├── Cargo.toml                 # 探针包的依赖声明文件
-        └── src/
-            └── main.rs                # 探针的全部 Rust 源代码（仅单文件）
+        ├── Cargo.toml                 # 探针包的依赖声明文件（继承顶层工作区配置）
+        └── src/                       # 按生产级 Rust 规范与本文阅读进度拆分的源码模块：
+            ├── main.rs                #   [55 行]  二进制命令行入口：解析 --mode 参数并调用核心库
+            ├── lib.rs                 #   [108 行] 核心库导出根 (Library Root) + 自动化单元测试套件
+            ├── inspect.rs             #   [139 行] 对应第二节 (--mode inspect)：读取配置并核验 272 个权重张量
+            ├── toy.rs                 #   [83 行]  对应第六节 (--mode toy)：用 3x4 玩具矩阵验证纸笔手算结果
+            ├── ops.rs                 #   [104 行] 对应第九节：trace 打印器 + 5 个核心数学算子
+            └── model.rs               #   [249 行] 对应第九、十节 (--mode real)：11 阶段完整前向推理与 KV Cache 循环
 ```
 
-如果你是第一次接触 Rust 工程，只需要知道两个核心概念：
+为了让第一次接触 Rust 的读者既能轻松读懂全部源码，又能从第一天起接触工业级 Rust 项目的标准写法，我们的代码组织遵循了四项生产级工程规范，并按本文的阅读顺序把 `crates/llm-tracer/src/` 拆成了职责单一的小模块（每个文件只有 55 到 249 行）：
+
+- **规范 1：薄二进制入口 + 核心库分离（`main.rs` + `lib.rs`）**：在生产级 Rust 项目中，`src/main.rs` 只负责解析命令行参数，绝不堆放业务逻辑；真正的算法模块全部由 `src/lib.rs` 导出。这样既能在 `lib.rs` 中直接运行 `cargo test` 自动化单元测试，也允许后续篇章的代码包直接复用本篇写好的算子。
+- **规范 2：工作区依赖与安全门禁集中管理（Workspace Lints & Dependencies）**：顶层 `Cargo.toml` 统一锁定依赖版本，开启 `unsafe_code = "forbid"`（全库禁止不安全裸指针）与 `clippy` 静态检查，并配置 `[profile.dev.package."*"] opt-level = 3`（让底层矩阵库在开发调试模式下也开启最高级别 `-O3` 编译优化，兼顾秒级编译与真机推理速度）。
+- **规范 3：零运行期下标崩溃（No Index Panic）**：从 `.safetensors` 字典取权重时，不使用一旦拼错键名就会直接崩溃的 `&weights["..."]` 下标访问，而是统一封装返回 `Result` 的 `get_tensor(&weights, name)?`，用 `?` 运算符优雅传递上下文错误。
+
+各源码模块与本文章节的对应关系如下表所示：
+
+| 源码文件 | 行数 | 对应本文章节与运行命令 | 这个文件里写了什么（读到对应章节时打开它即可） |
+|---|---|---|---|
+| **`src/main.rs` & `src/lib.rs`** | 55 行 / 108 行 | 全局入口与测试（`cargo test`） | `main.rs` 定义 `--mode inspect / toy / real` 命令行开关并定位模型目录；`lib.rs` 挂载四大业务模块并包含算子单元测试 |
+| **`src/inspect.rs`** | 139 行 | **第二节**（`cargo run -- --mode inspect`） | 定义 `LlamaConfig` 结构体（映射 `config.json`）、`load_config_and_weights` 权重加载函数、`get_tensor` 安全查表与 `run_inspect` 体检函数 |
+| **`src/toy.rs`** | 83 行 | **第六节**（`cargo run -- --mode toy`） | 将第六节 $B=1, T=3, d=4$ 的纸笔手算矩阵原样写成代码，核验两个注意力头的概率分布与拼接输出 |
+| **`src/ops.rs`** | 104 行 | **第九节**（基础算子库） | 存放 `trace` 白盒打印函数，以及整座模型仅需的 **5 个数学算子**（线性投影、RMSNorm、RoPE 频率表、GQA 键值复制、上三角因果掩码） |
+| **`src/model.rs`** | 249 行 | **第九、十节**（`cargo run -- --mode real`） | 包含 `forward_step`（走完 30 层、11 阶段完整前向计算）与 `run_real_trace`（调用分词器，串联 Step 1 Prefill 与 Step 2 Decode） |
+
+如果你以前没写过 Rust，只需先了解两个基本工程概念：
 
 1. **`Cargo.toml` 与代码包（Crate）是什么？**
-   在 Rust 中，每一个独立编译的项目包称为一个 **Crate**。每个项目包根目录下都必须有一份名为 **`Cargo.toml`** 的工程清单文件（类似 Python 的 `pyproject.toml` 或前端的 `package.json`），里面写明了项目名称和依赖库；而真正的代码则统一放在同级的 `src/main.rs` 里。
-   当你敲下 `cargo run` 时，`cargo` 会在当前目录及上层父目录中寻找 `Cargo.toml`（如果在一个既没有 `Cargo.toml`、父目录也没配工作区的文件夹里运行，就会报错 `could not find Cargo.toml`）。我们在仓库根目录和 `crates/llm-tracer` 下都配置好了 `Cargo.toml`，因此你在仓库任意目录下运行 `cargo run` 都能直接找到 `llm-tracer`。
+   在 Rust 中，每一个独立编译的项目包称为一个 **Crate**。每个包根目录下都有一份 **`Cargo.toml`** 清单文件（类似 Python 的 `pyproject.toml` 或前端的 `package.json`），声明项目名称和依赖库（本项目只用了 `serde_json` 解析 JSON、`tokenizers` 分词，以及 Hugging Face 官方轻量级张量库 `candle-core` 做矩阵乘法）。
+   当你敲下 `cargo run` 时，`cargo` 会在当前目录及父目录中寻找 `Cargo.toml`。我们在仓库根目录配置了工作区 `Cargo.toml`，因此你在仓库任意目录下运行 `cargo run` 都能直接编译运行 `llm-tracer`。
 
-2. **`llm-tracer` 这个程序到底干了什么？**
-   打开 `crates/llm-tracer/src/main.rs`，你会发现它只依赖了两个核心基础库：用 `serde_json` 解析 JSON 配置，用 Hugging Face 官方的轻量级 Rust 张量库 `candle-core` 读取 `.safetensors` 并执行矩阵乘法。
-   我们为它设计了三个命令行模式（通过 `--mode` 切换）：
-   - **`--mode inspect`（开箱体检）**：读取 `config.json` 与 `model.safetensors`，核验全部 272 个张量的名称、形状与参数量；
-   - **`--mode toy`（手算核验）**：跑通后文第六节 $B=1, T=3, d=4$ 的玩具模型，验证我们的纸笔手算结果；
-   - **`--mode real`（真机推理追踪）**：加载 `SmolLM2-135M-Instruct` 真实权重，跑完 11 个阶段的前向计算并生成回答。
-
-其中，即将运行的 `--mode inspect`（开箱体检）背后的核心 Rust 代码只有短短十几行，逻辑极其透明：
+2. **现在我们先看懂前两个文件：`src/main.rs` 与 `src/inspect.rs`**
+   先打开 `crates/llm-tracer/src/main.rs`（共 55 行）。它从核心库 `use llm_tracer::{inspect, model, toy};` 引入模块，定义 `Mode` 枚举并在 `main()` 函数里按模式分发：
 
 ```rust
-// 1. 读取 config.json 纯文本，反序列化为 Rust 结构体 LlamaConfig
-let cfg_str = std::fs::read_to_string(model_dir.join("config.json"))?;
-let cfg: LlamaConfig = serde_json::from_str(&cfg_str)?;
+// crates/llm-tracer/src/main.rs（核心入口）
+use llm_tracer::{inspect, model, toy};
 
-// 2. 加载 model.safetensors，返回一个 "张量名 -> Tensor" 的哈希表（共 272 个张量）
-let weights: HashMap<String, Tensor> =
-    candle_core::safetensors::load(model_dir.join("model.safetensors"), &Device::Cpu)?;
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum Mode {
+    Inspect, // 模式 1（第二节）：核验 272 个权重张量与参数账本
+    Toy,     // 模式 2（第六节）：核验 3x4 玩具矩阵手算结果
+    Real,    // 模式 3（第九、十节）：跑通 SmolLM2-135M 真机 11 阶段推理
+}
 
-// 3. 遍历字典，用 t.dims() 查看每个张量的形状，用 t.elem_count() 累加参数总数
-let w_embed = &weights["model.embed_tokens.weight"];
+fn main() -> Result<()> {
+    let args = Args::parse();
+    let dev = Device::Cpu;
+    let model_dir = resolve_model_dir(args.model_dir.as_deref());
+    match args.mode {
+        Mode::Inspect => inspect::run_inspect(&model_dir, &dev)?,
+        Mode::Toy     => toy::run_toy_verification(&dev)?,
+        Mode::Real    => model::run_real_trace(&model_dir, &dev)?,
+    }
+    Ok(())
+}
+```
+
+接着打开 `crates/llm-tracer/src/inspect.rs`（共 139 行）。这个文件专门负责我们即将运行的 `--mode inspect`，里面一共只干了三件事：
+
+```rust
+// crates/llm-tracer/src/inspect.rs（核心逻辑拆解）
+
+// 第 1 件事：定义与 config.json 字段一一对应的 Rust 结构体
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlamaConfig {
+    pub model_type: String,
+    pub vocab_size: usize,              // V = 49,152
+    pub hidden_size: usize,             // d = 576
+    pub intermediate_size: usize,       // d_ff = 1,536
+    pub num_hidden_layers: usize,       // L = 30
+    pub num_attention_heads: usize,     // h_q = 9
+    pub num_key_value_heads: usize,     // h_kv = 3
+    pub max_position_embeddings: usize, // T_max = 8,192
+    pub rms_norm_eps: f64,              // eps = 1e-5
+    pub rope_theta: f32,                // theta = 100,000.0
+    pub tie_word_embeddings: bool,      // true（首尾共享词嵌入矩阵）
+}
+
+impl LlamaConfig {
+    // 自动计算单个注意力头的宽度：d_h = d / h_q = 576 / 9 = 64
+    pub fn head_dim(&self) -> usize {
+        self.hidden_size / self.num_attention_heads
+    }
+}
+
+// 第 2 件事：读取 config.json，并把 model.safetensors 里的 272 个 BF16 张量加载为 F32
+pub fn load_config_and_weights(
+    model_dir: &Path,
+    dev: &Device,
+) -> Result<(LlamaConfig, HashMap<String, Tensor>)> {
+    let cfg_str = std::fs::read_to_string(model_dir.join("config.json"))?;
+    let cfg: LlamaConfig = serde_json::from_str(&cfg_str)?;
+
+    // 加载 .safetensors 文件，得到 "张量名字 -> Tensor" 的哈希表
+    let raw = candle_core::safetensors::load(model_dir.join("model.safetensors"), dev)?;
+    let mut f32_map = HashMap::with_capacity(raw.len());
+    for (k, v) in raw {
+        f32_map.insert(k, v.to_dtype(DType::F32)?); // 转为 32 位浮点数供 CPU 计算
+    }
+    Ok((cfg, f32_map))
+}
+
+/// 安全按名读取权重张量（避免使用 &weights[key] 在键名缺失时直接崩溃）
+pub fn get_tensor<'a>(weights: &'a HashMap<String, Tensor>, key: &str) -> Result<&'a Tensor> {
+    weights
+        .get(key)
+        .with_context(|| format!("Missing required weight tensor '{key}' in model.safetensors"))
+}
+
+// 第 3 件事：在 run_inspect() 中打印 Part 1、Part 2（第 0 层的 9 个张量）与 Part 3，并汇总参数量
+let w_embed = get_tensor(&weights, "model.embed_tokens.weight")?;
 println!("shape: {:?} | {} params", w_embed.dims(), w_embed.elem_count());
 
 let total_params: usize = weights.values().map(|t| t.elem_count()).sum();
-let bf16_megabytes = (total_params * 2) as f64 / 1_000_000.0; // 每个 BF16 参数占 2 字节
+let bf16_bytes = total_params * 2; // 每个 BF16 参数在硬盘上占 2 个字节
 ```
 
-看懂了这十几行代码，现在我们在仓库根目录下（或在 `crates/llm-tracer` 目录下）直接运行它：
+看懂了 `src/main.rs` 和 `src/inspect.rs` 的全部逻辑，现在我们在终端直接运行它：
 
 ```bash
 cargo run -- --mode inspect
@@ -982,9 +1064,58 @@ $$
 
 再右乘输出投影矩阵 $\mathbf{W}_O \in \mathbb{R}^{4 \times 4}$，就得到了注意力子层最终写回主干道的增量 $\Delta\mathbf{H}_{\text{attn}} \in \mathbb{R}^{[1, 3, 4]}$。每一格数字都来路清楚，没有任何黑盒。
 
-### 第五步：在终端运行 `--mode toy`，核验我们的手算结果
+### 第五步：拆解 `src/toy.rs` 源码，并在终端运行 `--mode toy` 核验手算结果
 
-刚才我们用纸笔算出了 $\mathbf{Q}_{\text{raw}}, \mathbf{K}_{\text{raw}}, \mathbf{V}_{\text{raw}}$、两个头的注意力概率 $\mathbf{A}^{(1)}, \mathbf{A}^{(2)}$ 以及合并后的 $\mathbf{O}_{\text{concat}}$。现在打开终端，运行 `llm-tracer` 的第二个模式 `--mode toy`，让计算机用 32 位浮点数把上面这道题重算一遍：
+刚才我们用纸笔算出了 $\mathbf{Q}_{\text{raw}}, \mathbf{K}_{\text{raw}}, \mathbf{V}_{\text{raw}}$、两个头的注意力概率 $\mathbf{A}^{(1)}, \mathbf{A}^{(2)}$ 以及合并后的 $\mathbf{O}_{\text{concat}}$。这段手算过程在代码里长什么样？
+
+现在你可以打开第 3 个源码文件 **`crates/llm-tracer/src/toy.rs`**（整个文件只有 83 行）。你会发现它没有任何多余包装，完全就是把我们刚才纸面上的矩阵和四步公式逐行翻译成了 Rust 代码：
+
+```rust
+// crates/llm-tracer/src/toy.rs（完整代码逻辑）
+pub fn run_toy_verification(dev: &Device) -> Result<()> {
+    let (b, t, d, h, d_h) = (1, 3, 4, 2, 2);
+
+    // 第一步：用 Tensor::from_slice 构造 [1, 3, 4] 的输入隐藏状态 X（对应 "我"、"喜欢"、"写"）
+    let x = Tensor::from_slice(
+        &[
+            1.0f32, 0.0, 1.0, 0.0, // t=0 ("我")
+            0.0, 1.0, 1.0, 0.0,    // t=1 ("喜欢")
+            1.0, 1.0, 0.0, 1.0,    // t=2 ("写")
+        ],
+        (b, t, d),
+        dev,
+    )?;
+
+    // 第二步：构造 [4, 4] 的参数矩阵 W_Q, W_K, W_V，并相乘得到 Q_raw, K_raw, V_raw ([1, 3, 4])
+    // （此处略去 w_q_math, w_k_math, w_v_math 的常量数组定义，数值与上文纸面矩阵完全一致）
+    let q_raw = x.reshape((b * t, d))?.matmul(&w_q_math)?.reshape((b, t, d))?;
+    let k_raw = x.reshape((b * t, d))?.matmul(&w_k_math)?.reshape((b, t, d))?;
+    let v_raw = x.reshape((b * t, d))?.matmul(&w_v_math)?.reshape((b, t, d))?;
+
+    // 拆分成 h = 2 个注意力头，每头宽度 d_h = 2：[1, 3, 4] -> [1, 3, 2, 2] -> [1, 2, 3, 2]
+    let q = q_raw.reshape((b, t, h, d_h))?.transpose(1, 2)?.contiguous()?;
+    let k = k_raw.reshape((b, t, h, d_h))?.transpose(1, 2)?.contiguous()?;
+    let v = v_raw.reshape((b, t, h, d_h))?.transpose(1, 2)?.contiguous()?;
+
+    // 第三步：算 QK^T 除以 sqrt(2)，盖上因果掩码，做 Softmax 得到概率方阵，再乘 V
+    let scale = 1.0f64 / (d_h as f64).sqrt();
+    let scaled_scores = (&q.matmul(&k.t()?)? * scale)?;
+    let masked_scores = apply_causal_mask(&scaled_scores, 0)?;
+    let attn_probs = candle_nn::ops::softmax_last_dim(&masked_scores)?; // [1, 2, 3, 3]
+    let context = attn_probs.matmul(&v)?;                               // [1, 2, 3, 2]
+
+    // 第四步：把两个头重新拼回 [1, 3, 4]
+    let o_concat = context.transpose(1, 2)?.contiguous()?.reshape((b, t, d))?;
+
+    // 打印 Head 1 (下标 0,0)、Head 2 (下标 0,1) 的概率矩阵与拼接后的 O_concat
+    println!("{:?}", attn_probs.i((0, 0))?.to_vec2::<f32>()?);
+    println!("{:?}", attn_probs.i((0, 1))?.to_vec2::<f32>()?);
+    println!("{:?}", o_concat.i(0)?.to_vec2::<f32>()?);
+    Ok(())
+}
+```
+
+看清了 `src/toy.rs` 的代码，现在在终端运行 `--mode toy`：
 
 ```bash
 cargo run -- --mode toy
@@ -1166,10 +1297,19 @@ $$
 3. **RoPE 的半区配对约定与 `[T, d_h / 2]` 频率表**：
    无论是 `SmolLM2`、`Llama-3.2` 还是 `Qwen2.5`，它们在 Hugging Face `.safetensors` 格式下的权重全部遵循 **GPT-NeoX 非交错半区配对（`rotate_half`）**——即单头维度 $d_h = 64$ 的前半区 `[0..32]` 与后半区 `[32..64]` 配对旋转。在 `candle` 中对应调用 `candle_nn::rotary_emb::rope`（传入形状为 `[T, 32]` 的 `cos` 和 `sin` 表），与 Python 官方参考实现的单层误差小于 $10^{-5}$。
 
-### 1. 核心白盒追踪代码（Rust + `candle-core`）
+### 1. 拆解最后两个模块文件：`src/ops.rs`（基础算子库）与 `src/model.rs`（11 阶段推理引擎）
+
+到目前为止，我们已经看完了 `llm-tracer` 5 个源码文件中的前 3 个（`main.rs`、`inspect.rs`、`toy.rs`）。现在我们打开最后两个核心文件——**`src/ops.rs`（104 行）** 与 **`src/model.rs`（248 行）**，把整座大模型前向推理的每一行代码彻底看穿。
+
+#### （1）打开 `crates/llm-tracer/src/ops.rs`（共 104 行）：探针打印器与 5 个数学算子
+
+你可能会惊讶：跑通一整座现代 Llama 架构大模型，底层到底需要写几个数学算子函数？
+
+答案是：**只要 5 个函数，加起来不到 100 行代码。** 打开 `src/ops.rs`，里面从上到下依次是 `trace` 打印器和这 5 个基础算子：
 
 ```rust
-use candle_core::{DType, Result, Tensor};
+// crates/llm-tracer/src/ops.rs（完整代码与逐函数解析）
+use candle_core::{DType, Device, Result, Tensor};
 
 #[derive(Clone, Copy)]
 pub enum Role {
@@ -1178,35 +1318,54 @@ pub enum Role {
     KvCache,    // 键值缓存：跨步保存历史位置的 K 与 V 激活张量
 }
 
+/// 探针打印函数：按 [阶段名] 张量名 | 角色 | 形状 | [前 4 个浮点数...] 格式输出一行追踪记录
 pub fn trace(stage: &str, name: &str, role: Role, t: &Tensor) -> Result<()> {
     let role_tag = match role {
         Role::Weight => "WEIGHT    ",
         Role::Activation => "ACTIVATION",
         Role::KvCache => "KV_CACHE  ",
     };
-    let flat = t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-    let head: Vec<String> = flat.iter().take(4).map(|v| format!("{:+.4}", v)).collect();
+    let elem_count = t.elem_count().min(4);
+    let flat_slice = t.flatten_all()?.narrow(0, 0, elem_count)?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    let head: Vec<String> = flat_slice.iter().map(|v| format!("{:+.4}", v)).collect();
     println!(
-        "[{:<14}] {:<38} | {} | shape: {:<20} | [{} ...]",
-        stage,
-        name,
-        role_tag,
-        format!("{:?}", t.dims()),
-        head.join(", ")
+        "[{:<14}] {:<36} | {} | shape: {:<20} | [{} ...]",
+        stage, name, role_tag, format!("{:?}", t.dims()), head.join(", ")
     );
     Ok(())
 }
 
-/// 二维重塑快路径：三维激活 [B, T, d_in] 与 safetensors 权重 [d_out, d_in] 的零拷贝线性投影
+/// 算子 1 —— 无偏置线性投影：将 [B, T, d_in] 展平为 [B*T, d_in]，乘转置权重 [d_in, d_out]，再还原为 [B, T, d_out]
 pub fn linear_no_bias(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
     let (b, t, d_in) = x.dims3()?;
     let (d_out, _) = weight.dims2()?;
-    x.reshape((b * t, d_in))?
-        .matmul(&weight.t()?)?
-        .reshape((b, t, d_out))
+    x.reshape((b * t, d_in))?.matmul(&weight.t()?)?.reshape((b, t, d_out))
 }
 
-/// GQA 键值扩展：将 [B, h_kv, T, d_h] 按组连续复制 n_rep 次扩展为 [B, h_q, T, d_h]
+/// 算子 2 —— RMSNorm 均方根归一化：x / sqrt(mean(x^2) + eps) * weight，进出形状保持 [B, T, d]
+pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
+    candle_nn::ops::rms_norm(x, weight, eps as f32)
+}
+
+/// 算子 3 —— 预计算 RoPE 旋转位置编码的余弦 (cos) 与正弦 (sin) 查找表（形状均为 [max_seq_len, d_h / 2]）
+pub fn precompute_rope_tables(
+    max_seq_len: usize,
+    d_h: usize,
+    theta: f32,
+    dev: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let half = d_h / 2; // 单头 64 维两两配对，共有 32 组旋转频率
+    let inv_freq: Vec<f32> = (0..half)
+        .map(|i| 1.0 / theta.powf((2 * i) as f32 / d_h as f32))
+        .collect();
+    let inv_freq = Tensor::from_vec(inv_freq, (1, half), dev)?;
+    let positions: Vec<f32> = (0..max_seq_len).map(|p| p as f32).collect();
+    let t = Tensor::from_vec(positions, (max_seq_len, 1), dev)?;
+    let freqs = t.matmul(&inv_freq)?; // 外积：[max_seq_len, 1] x [1, 32] -> [max_seq_len, 32]
+    Ok((freqs.cos()?, freqs.sin()?))
+}
+
+/// 算子 4 —— GQA 键值头复制扩展：将 [B, h_kv, T, d_h] 的每个键值头连续复制 n_rep 次，对齐为 [B, h_q, T, d_h]
 pub fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
     if n_rep == 1 {
         return Ok(x.clone());
@@ -1216,49 +1375,125 @@ pub fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
         .expand((b, h_kv, n_rep, seq_len, d_h))?
         .reshape((b, h_kv * n_rep, seq_len, d_h))
 }
+
+/// 算子 5 —— 上三角因果掩码：将所有 j > i + offset（偷看未来）的位置设为负无穷 -inf
+pub fn apply_causal_mask(scores: &Tensor, offset: usize) -> Result<Tensor> {
+    let (b, h, q_len, kv_len) = scores.dims4()?;
+    if q_len == 1 {
+        return Ok(scores.clone()); // Decode 阶段每次只进 1 个新词，它本来就能看前面所有词，无需掩码
+    }
+    let mut mask_vec = vec![0.0f32; q_len * kv_len];
+    for i in 0..q_len {
+        for j in 0..kv_len {
+            if j > i + offset {
+                mask_vec[i * kv_len + j] = f32::NEG_INFINITY;
+            }
+        }
+    }
+    let mask = Tensor::from_vec(mask_vec, (1, 1, q_len, kv_len), scores.device())?
+        .broadcast_as((b, h, q_len, kv_len))?;
+    scores.broadcast_add(&mask)
+}
 ```
 
-在这三个基础函数之上，单层 Transformer Block（以第 0 层为例）的完整前向计算在 `crates/llm-tracer/src/main.rs` 里只有不到 60 行，每一步都和我们前面讲过的阶段一一对应：
+#### （2）打开 `crates/llm-tracer/src/model.rs`：走通 11 阶段的 `forward_step` 核心引擎
+
+有了 `src/ops.rs` 里的 5 个算子，我们打开 `src/model.rs`。这个文件里只有两个函数：上半部分是执行一次完整前向推理（阶段 01 到阶段 10）的 **`forward_step`**，下半部分是驱动分词与两步生成循环的 **`run_real_trace`**（我们会在第十节结合 KV Cache 拆解下半部分）。
+
+先看 `forward_step` 的完整实现——从阶段 01 拿到 `input_ids`，到阶段 02 用 `index_select` 查表，再到 `for l in 0..30` 循环跑完 30 层 Transformer，最后在阶段 09/10 算出 `logits` 并用 `argmax` 挑出最高分词号，全程一气呵成：
 
 ```rust
-    // 1. 进入注意力车间前：先做 Pre-RMSNorm 归一化校准
-    let x_norm = candle_nn::ops::rms_norm(&x, &w_in_norm, cfg.rms_norm_eps)?;
-    trace("03.PreRMSNorm", "X_norm (Layer 0)", Role::Activation, &x_norm)?;
+// crates/llm-tracer/src/model.rs —— 上半部分：forward_step 完整实现
+pub fn forward_step(
+    step_label: &str,
+    input_ids: &Tensor,                        // 输入词号张量：Prefill 时为 [1, 10]，Decode 时为 [1, 1]
+    offset: usize,                             // 起始位置偏移：Prefill 时为 0，Decode 时为 10
+    cfg: &LlamaConfig,
+    weights: &HashMap<String, Tensor>,
+    cos_all: &Tensor,
+    sin_all: &Tensor,
+    kv_caches: &mut [Option<(Tensor, Tensor)>], // 30 层的 KV 缓存槽位
+) -> Result<u32> {
+    let (b, seq_len) = input_ids.dims2()?;
+    let (d, h_q, h_kv, d_h) = (cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim());
+    let n_rep = h_q / h_kv; // 9 / 3 = 3（每 3 个查询头共享 1 组键值头）
 
-    // 2. 阶段 04：Q / K / V 线性投影（乘上各自的权重矩阵）
-    let q_lin = linear_no_bias(&x_norm, &w_q)?; // [B, T, 576]
-    let k_lin = linear_no_bias(&x_norm, &w_k)?; // [B, T, 192] (3 个 KV 头 * 64)
-    let v_lin = linear_no_bias(&x_norm, &w_v)?; // [B, T, 192]
+    // 【阶段 01 & 02】输入 Token IDs -> 从 model.embed_tokens.weight ([49152, 576]) 按行查表得到初始残差流 [B, T, 576]
+    trace("01.Tokens", "input_ids", Role::Activation, input_ids)?;
+    let w_embed = get_tensor(weights, "model.embed_tokens.weight")?;
+    trace("02.Embedding", "model.embed_tokens.weight", Role::Weight, w_embed)?;
+    let flat_ids = input_ids.flatten_all()?;
+    let mut hidden = w_embed.index_select(&flat_ids, 0)?.reshape((b, seq_len, d))?;
+    trace("02.Embedding", "X_0 (embedded hidden state)", Role::Activation, &hidden)?;
 
-    // 3. 阶段 03/04：拆头转置为 [B, h, T, 64]，并对 Q 和 K 施加 RoPE 旋转位置编码
-    let q = q_lin.reshape((b, t, h_q, d_h))?.transpose(1, 2)?.contiguous()?;  // [B, 9, T, 64]
-    let k = k_lin.reshape((b, t, h_kv, d_h))?.transpose(1, 2)?.contiguous()?; // [B, 3, T, 64]
-    let v = v_lin.reshape((b, t, h_kv, d_h))?.transpose(1, 2)?.contiguous()?; // [B, 3, T, 64]
+    // 【阶段 03 准备】按当前位置窗口 [offset .. offset + seq_len] 切出对应的 RoPE cos/sin 表
+    let cos = cos_all.narrow(0, offset, seq_len)?;
+    let sin = sin_all.narrow(0, offset, seq_len)?;
 
-    let q_rope = candle_nn::rotary_emb::rope(&q, &cos, &sin)?; // [B, 9, T, 64]
-    let k_rope = candle_nn::rotary_emb::rope(&k, &cos, &sin)?; // [B, 3, T, 64]
+    // 【阶段 03 — 08】循环穿过全部 30 层 Transformer（仅在第 0 层打印内部拆解日志，避免 30 层重复刷屏）
+    for (l, kv_slot) in kv_caches.iter_mut().enumerate().take(cfg.num_hidden_layers) {
+        let p = format!("model.layers.{l}");
+        let trace_layer = l == 0;
 
-    // 4. 阶段 05：将 3 个 KV 头复制扩展为 9 个头，计算缩放点积 + 因果掩码 + Softmax + 乘 V
-    let k_full = repeat_kv(&k_cache, h_q / h_kv)?; // [B, 3, S, 64] -> [B, 9, S, 64]
-    let v_full = repeat_kv(&v_cache, h_q / h_kv)?; // [B, 3, S, 64] -> [B, 9, S, 64]
+        // 1. 进入第一车间（自注意力）前：先过 input_layernorm (Pre-RMSNorm)
+        let w_ln1 = get_tensor(weights, &format!("{p}.input_layernorm.weight"))?;
+        let x_norm = rms_norm(&hidden, w_ln1, cfg.rms_norm_eps)?;
 
-    let scale = 1.0f64 / (d_h as f64).sqrt();
-    let scores = (q_rope.matmul(&k_full.t()?)? * scale)?; // [B, 9, T, S]
-    let masked_scores = apply_causal_mask(&scores)?;
-    let probs = candle_nn::ops::softmax_last_dim(&masked_scores)?; // [B, 9, T, S]
-    let context = probs.matmul(&v_full)?; // [B, 9, T, 64]
+        // 2. 【阶段 04】乘 W_Q, W_K, W_V 投影矩阵，并拆头转置为 [B, h, T, 64]
+        let q_lin = linear_no_bias(&x_norm, get_tensor(weights, &format!("{p}.self_attn.q_proj.weight"))?)?; // [B, T, 576]
+        let k_lin = linear_no_bias(&x_norm, get_tensor(weights, &format!("{p}.self_attn.k_proj.weight"))?)?; // [B, T, 192]
+        let v_lin = linear_no_bias(&x_norm, get_tensor(weights, &format!("{p}.self_attn.v_proj.weight"))?)?; // [B, T, 192]
 
-    // 5. 阶段 06：多头合并回 [B, T, 576]，乘 W_O 输出矩阵，并加回残差流
-    let o_concat = context.transpose(1, 2)?.contiguous()?.reshape((b, t, d))?;
-    let attn_out = linear_no_bias(&o_concat, &w_o)?;
-    let h_mid = (&x + &attn_out)?; // 第一次残差相加
+        let q = q_lin.reshape((b, seq_len, h_q, d_h))?.transpose(1, 2)?.contiguous()?;  // [B, 9, T, 64]
+        let k = k_lin.reshape((b, seq_len, h_kv, d_h))?.transpose(1, 2)?.contiguous()?; // [B, 3, T, 64]
+        let v = v_lin.reshape((b, seq_len, h_kv, d_h))?.transpose(1, 2)?.contiguous()?; // [B, 3, T, 64]
 
-    // 6. 阶段 07：进入 MLP 车间，Pre-RMSNorm + SwiGLU (gate * up -> down) + 第二次残差相加
-    let h_norm = candle_nn::ops::rms_norm(&h_mid, &w_post_norm, cfg.rms_norm_eps)?;
-    let gate = candle_nn::ops::silu(&linear_no_bias(&h_norm, &w_gate)?)?; // [B, T, 1536]
-    let up = linear_no_bias(&h_norm, &w_up)?;                             // [B, T, 1536]
-    let mlp_out = linear_no_bias(&(gate * up)?, &w_down)?;                // [B, T, 576]
-    let x_next = (&h_mid + &mlp_out)?; // 本层最终输出: [B, T, 576]
+        // 3. 【阶段 03/04】对 Q 和 K 施加 RoPE 旋转位置编码（V 不旋转，形状不变）
+        let q_rope = candle_nn::rotary_emb::rope(&q, &cos, &sin)?;
+        let k_rope = candle_nn::rotary_emb::rope(&k, &cos, &sin)?;
+
+        // 4. 【KV Cache 拼接】若本层已有历史缓存，则沿序列维度（dim = 2）把新算出的 K/V 拼在历史缓存末尾
+        let (k_cache, v_cache) = match kv_slot.take() {
+            Some((prev_k, prev_v)) => (Tensor::cat(&[&prev_k, &k_rope], 2)?, Tensor::cat(&[&prev_v, &v], 2)?),
+            None => (k_rope, v),
+        };
+        *kv_slot = Some((k_cache.clone(), v_cache.clone()));
+
+        // 5. 【阶段 05】GQA 键值头 3->9 广播 + 缩放点积 QK^T/sqrt(64) + 因果掩码 + Softmax + 乘 V
+        let k_full = repeat_kv(&k_cache, n_rep)?;
+        let v_full = repeat_kv(&v_cache, n_rep)?;
+        let scale = 1.0f64 / (d_h as f64).sqrt();
+        let attn_scores = (q_rope.matmul(&k_full.t()?)? * scale)?;
+        let masked_scores = apply_causal_mask(&attn_scores, offset)?;
+        let attn_probs = candle_nn::ops::softmax_last_dim(&masked_scores)?;
+        let context = attn_probs.matmul(&v_full.contiguous()?)?;
+
+        // 6. 【阶段 06】多头合并回 [B, T, 576]，乘 W_O 输出矩阵，并加回残差流（第一次残差相加）
+        let o_concat = context.transpose(1, 2)?.contiguous()?.reshape((b, seq_len, d))?;
+        let attn_out = linear_no_bias(&o_concat, get_tensor(weights, &format!("{p}.self_attn.o_proj.weight"))?)?;
+        let h_mid = (&hidden + &attn_out)?;
+
+        // 7. 【阶段 07】进入第二车间（SwiGLU MLP）：过 post_attention_layernorm -> gate * up 升维到 1536 -> down 压回 576 -> 第二次残差相加
+        let h_norm = rms_norm(&h_mid, get_tensor(weights, &format!("{p}.post_attention_layernorm.weight"))?, cfg.rms_norm_eps)?;
+        let gate = candle_nn::ops::silu(&linear_no_bias(&h_norm, get_tensor(weights, &format!("{p}.mlp.gate_proj.weight"))?)?)?;
+        let up = linear_no_bias(&h_norm, get_tensor(weights, &format!("{p}.mlp.up_proj.weight"))?)?;
+        let mlp_out = linear_no_bias(&(&gate * &up)?, get_tensor(weights, &format!("{p}.mlp.down_proj.weight"))?)?;
+        hidden = (&h_mid + &mlp_out)?; // 更新主干残差流，送入下一层 l + 1
+    }
+
+    // 【阶段 08】走出第 29 层后，经过第 272 个张量 model.norm.weight 做最终归一化校准
+    let h_final = rms_norm(&hidden, get_tensor(weights, "model.norm.weight")?, cfg.rms_norm_eps)?;
+    trace("08.RepeatL30", "X_30 (after 30 layers + norm)", Role::Activation, &h_final)?;
+
+    // 【阶段 09】LM Head 输出投影：直接复用入口的 w_embed ([49152, 576])，将 [B, T, 576] 映射为词表得分 [B, T, 49152]
+    let logits = linear_no_bias(&h_final, w_embed)?;
+    trace("09.LM_Head", "Logits [B, T, V]", Role::Activation, &logits)?;
+
+    // 【阶段 10】只取序列最后一个位置 (seq_len - 1) 的 49152 维得分，用 argmax 挑出最高分的 Token ID
+    let last_logits = logits.i((0, seq_len - 1))?;
+    let next_token_id = last_logits.argmax(0)?.to_scalar::<u32>()?;
+    Ok(next_token_id)
+}
 ```
 
 ### 2. 真实运行记录：一眼看穿全局张量流向与真机吐字
@@ -1351,6 +1586,41 @@ cargo run -- --mode real
 
 - **它缓存了什么？** 它缓存的既不是模型的静态权重，也不是整个隐藏状态，而是每一层 Transformer Attention 中已经算过的历史位置的 **$\mathbf{K}$ 激活张量和 $\mathbf{V}$ 激活张量**（对 $\mathbf{K}$ 而言是施加 RoPE 旋转之后的张量，且直接按未广播的 $h_{kv} = 3$ 个键值头存储以节省显存）。
 - **为什么不缓存 $\mathbf{Q}$？** 因为历史位置的 $\mathbf{Q}_{1..10}$ 只用来预测历史位置自己的下一个词，那些词早就生成完了，后续步骤永远不会再回头去查旧的 $\mathbf{Q}$。
+
+现在我们打开 `crates/llm-tracer/src/model.rs` 的下半部分，看懂最后一个函数 **`run_real_trace`**。它把 `tokenizer.json` 的分词/反查与两次 `forward_step`（Step 1 Prefill 喂 10 个词，`offset = 0`；Step 2 Decode 只喂 1 个新词，`offset = 10`）串联在了一起：
+
+```rust
+// crates/llm-tracer/src/model.rs —— 下半部分：run_real_trace 完整实现
+pub fn run_real_trace(model_dir: &Path, dev: &Device) -> Result<()> {
+    let (cfg, weights) = load_config_and_weights(model_dir, dev)?;
+    let (cos_all, sin_all) = precompute_rope_tables(128, cfg.head_dim(), cfg.rope_theta, dev)?;
+    let mut kv_caches: Vec<Option<(Tensor, Tensor)>> = vec![None; cfg.num_hidden_layers]; // 30 层初始为空
+
+    // 1. 加载 tokenizer.json，将 ChatML 对话模板编码为 10 个整数 Token ID
+    let tok = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
+    let raw_prompt = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n";
+    let enc = tok.encode(raw_prompt, false).unwrap();
+    let prompt_ids: Vec<u32> = enc.get_ids().to_vec(); // [1, 4093, 198, 19556, 2, 198, 1, 520, 9531, 198]
+
+    // 2. Step 1 (Prefill)：一次性喂入全部 10 个输入词（形状 [1, 10]，offset = 0），填满 30 层 KV Cache
+    let prefill_input = Tensor::from_slice(&prompt_ids, (1, prompt_ids.len()), dev)?;
+    let first_generated_id = forward_step(
+        "STEP 1: PREFILL (T = 10 ChatML prompt tokens)",
+        &prefill_input, 0, &cfg, &weights, &cos_all, &sin_all, &mut kv_caches,
+    )?; // 返回 19556 ("Hello")
+
+    // 3. Step 2 (Decode)：只喂入刚生成的 1 个新词（形状 [1, 1]，offset = 10），直接复用并追加 KV Cache
+    let decode_input = Tensor::from_slice(&[first_generated_id], (1, 1), dev)?;
+    let second_generated_id = forward_step(
+        "STEP 2: AUTOREGRESSIVE DECODE (T_new = 1, KV Cache 10 -> 11)",
+        &decode_input, prompt_ids.len(), &cfg, &weights, &cos_all, &sin_all, &mut kv_caches,
+    )?; // 返回 17 ("!")
+
+    let full_reply = tok.decode(&[first_generated_id, second_generated_id], false).unwrap();
+    println!("[11.Summary    ] First 2 generated tokens decoded: {:?}", full_reply); // "Hello!"
+    Ok(())
+}
+```
 
 紧接着刚才的 Step 1，你看探针输出的 **Step 2（Decode 自回归解码）** 真机日志，就能亲眼看到序列维度从 `10` 瞬间塌缩为 `1`、而 KV Cache 从 `10` 增长到 `11` 的全过程：
 
