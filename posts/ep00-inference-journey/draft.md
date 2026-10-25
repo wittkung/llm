@@ -298,13 +298,16 @@ $$
 - **`README.md`、`LICENSE` 与 `onnx/` 目录**：
   `README.md` 是记录训练数据与评测基准的**模型卡（Model Card）**；`LICENSE` 为开源协议声明（本模型采用 `Apache-2.0` 协议）；`onnx/` 目录则存放转换为 **ONNX** 开放中间格式的权重，供浏览器 WebGPU 或移动端引擎调用。
 
-### 3. 第三步：下载核心三件套
+### 3. 第三步：克隆配套代码仓库并下载三个模型文件
 
-在我们的配套仓库根目录下运行下面几行命令，把这三个核心文件拉到本地 `models/SmolLM2-135M-Instruct` 文件夹中（其中 `curl -L` 表示自动跟随云存储跳转链接，`-o` 表示保存到本地指定路径）。
+搞清楚了上面这些文件的来龙去脉，现在我们打开终端，先把本篇的配套代码仓库克隆到本地，然后把这三个核心模型文件下载到仓库的 `models/SmolLM2-135M-Instruct` 文件夹中（其中 `curl -L` 表示自动跟随云存储跳转链接，`-o` 表示保存到本地指定路径）。
 
 **macOS / Linux / WSL 终端：**
 
 ```bash
+git clone https://github.com/wittkung/llm.git
+cd llm
+
 mkdir -p models/SmolLM2-135M-Instruct
 
 # 国内网络可直接用 hf-mirror.com 满速下载（海外网络将 hf-mirror.com 换回 huggingface.co 即可）
@@ -318,6 +321,9 @@ curl -L "${BASE_URL}/model.safetensors" -o models/SmolLM2-135M-Instruct/model.sa
 **Windows PowerShell**（注意在 PowerShell 中需写 `curl.exe` 以调用系统原生下载工具）：
 
 ```powershell
+git clone https://github.com/wittkung/llm.git
+cd llm
+
 New-Item -ItemType Directory -Force -Path models\SmolLM2-135M-Instruct | Out-Null
 
 $BASE_URL = "https://hf-mirror.com/HuggingFaceTB/SmolLM2-135M-Instruct/resolve/main"
@@ -512,9 +518,9 @@ Total Tensors: 272 | Total Parameters: 134515008 (~134.52M) | BF16 Disk Footprin
 
 **所有参数矩阵的形状只由模型自身的架构常数（$V, d, h, d_h$）决定，绝不包含 $B$ 和 $T$；而所有中间激活的形状，必定处处带着批大小 $B$ 和序列长度 $T$。**
 
-这就像横跨山谷修筑的石砌引水渠：石槽的宽窄在竣工那天就已经凿定，而渠里流过多少水，全看今天山上下了多大的雨。无论你输入的是 3 个词还是 3000 个词，磁盘上映射进来的参数矩阵形状纹丝不动；中间激活则会随着 $T$ 的涨落像手风琴一样伸缩。
+也就是说，无论你这次输入的是 3 个词还是 3000 个词，从硬盘加载进来的 272 个参数矩阵形状永远固定不变；只有中间激活会随着本次输入的句子条数 $B$ 和词数 $T$ 动态变化。
 
-带着这条铁律，我们先看一眼这趟旅程的全景路标：
+带着这条判断铁律，我们先看一眼整趟前向计算的 11 阶段全景表：
 
 | 阶段 | 主要形状变化 | 参与的参数矩阵（静态只读） | 产生的中间激活（随输入变化） | 这一站要解决什么问题 |
 |---|---|---|---|---|
@@ -530,7 +536,7 @@ Total Tensors: 272 | Total Parameters: 134515008 (~134.52M) | BF16 Disk Footprin
 | **10. 选择下一个 Token** | $[B, T, V] \to [B, V] \to [B, 1]$ | 无参数矩阵 | 末位分数 $\text{logits}_{\text{last}}: [B, V]$<br>概率分布 $\mathbf{p}: [B, V]$ | 算出了 $T$ 个位置的分数，为什么只取最后一行？ |
 | **11. 自回归继续生成** | 追加 Token，步进循环 | 全模型权重再次复用 | 新增激活与持久化的 **KV Cache** | 为什么答案只能一个词一个词往外蹦？ |
 
-现在，我们推开第一扇门。
+清楚了参数矩阵和中间激活的区别，下面我们就顺着这张表，从第 01 阶段开始一步步往下走。
 
 ---
 
@@ -579,23 +585,21 @@ $$
 
 ### 02. Embedding 查表：从 `[B, T]` 到 `[B, T, d]`
 
-模型的做法简单而直接：给词典里的每一个 Token 分配一行长长的浮点数向量。
+这一步我们在前面拆解第一张权重矩阵 `model.embed_tokens.weight` 时已经接触过：模型给词表里的每一个 Token 都分配了一行长度为 $d$ 的浮点数向量，合起来就是形状为 $[V, d]$ 的**词嵌入矩阵（Token Embedding Matrix）** $\mathbf{W}_E$。
 
-在模型的参数文件里，躺着整个网络的第一张巨型参数矩阵——**词嵌入矩阵（Token Embedding Matrix）** $\mathbf{W}_E$。它的行数等于词表大小 $V$，列数等于模型的隐藏层维度 $d$，形状为 $[V, d]$。
+当形状为 $[B, T]$ 的 `input_ids` 到达时，程序只需把每个整数 ID 当作行号，直接去 $\mathbf{W}_E$ 里把对应的那一行拷出来（注：在数学教材里，这一步常被写成“把整数 ID 变成只有对应位置为 1、其余位置全为 0 的 $V$ 维独热向量 One-Hot Vector，再乘以矩阵 $\mathbf{W}_E$”；但在实际代码里，没人会傻傻地做四万九千维的零乘法，直接按行号拷内存最快，结果完全等价）：
 
-当形状为 $[B, T]$ 的 `input_ids` 到达时，模型不需要做任何复杂的算术，只需把每个整数 ID 当作行号，去 $\mathbf{W}_E$ 里把对应的那一行抽出来（在数学上，这完全等价于把每个整数写成长度为 $V$ 的 One-Hot 独热向量，再右乘矩阵 $\mathbf{W}_E$）：
+- 拿走第 `1` 行，得到第 1 个词的 $d$ 维向量；
+- 拿走第 `3` 行，得到第 2 个词的 $d$ 维向量；
+- 拿走第 `4` 行，得到第 3 个词的 $d$ 维向量。
 
-- 拿走第 `1` 行，得到长度为 $d$ 的向量；
-- 拿走第 `3` 行，得到第二个长度为 $d$ 的向量；
-- 拿走第 `4` 行，得到第三个长度为 $d$ 的向量。
-
-把这 $T$ 个长度为 $d$ 的向量按原有顺序叠在一起，原来的每一个整数都膨胀成了一条 $d$ 维向量。张量的形状随之完成了第一次跃迁：
+把这 $T$ 个长度为 $d$ 的行向量按词语先后顺序上下叠在一起，原来的每一个整数就变成了一条 $d$ 维向量，张量形状完成了第一次变化：
 
 $$
 \text{input\_ids}: [B, T] \xrightarrow{\text{按行查表 } \mathbf{W}_E: [V, d]} \mathbf{H}^{(0)}: [B, T, d]
 $$
 
-这批新鲜出炉的 $\mathbf{H}^{(0)}$ 就是第 0 层 Transformer 的初始**隐藏状态（Hidden States）**，也是流淌在模型主干道——我们称之为**残差流（Residual Stream）**——上的第一股活水。
+这批查表得到的 $\mathbf{H}^{(0)}$ 就是第 0 层 Transformer 的初始**隐藏状态（Hidden States）**。在 Transformer 架构里，这个形状恒为 $[B, T, d]$ 的主干张量也被称为**残差流（Residual Stream）**——因为在接下来的 30 层网络里，它的外在形状 $[B, T, d]$ 始终不变，每一层算出来的新特征都是通过加法直接叠加到它上面的。
 
 **本阶段对应的 `config.json` 超参数：**
 
@@ -603,33 +607,35 @@ $$
 - `"torch_dtype": "bfloat16"`：指定权重张量采用 16 位脑浮点数（BF16，每参数占 2 字节）存储，因此全模型 $134,515,008\text{ 参数} \times 2\text{ 字节} = 269.03\text{ MB}$；
 - `"initializer_range": 0.0416666...`：数值上等于 $1 / \sqrt{d} = 1 / \sqrt{576} \approx 0.04167$，代表模型在预训练初始化阶段生成随机权重矩阵时所用的正态分布标准差。
 
-可是，如果我们把目光停在 $\mathbf{H}^{(0)}$ 的形状 $[B, T, d]$ 上，很快就会发现一个致命的盲区。
+可是，如果我们只看 $\mathbf{H}^{(0)}$ 的形状 $[B, T, d]$，很快就会发现一个严重的漏洞。
 
-在接下来的网络层里，模型对这 $T$ 个词向量的加工全靠矩阵乘法。而矩阵乘法是逐行独立作用的：如果你把输入序列里的 `"猫 追 狗"` 调换成 `"狗 追 猫"`，查表得到的无非是把第 0 行和第 2 行对调了一下。如果不引入额外的信息，后面的线性层算出来的结果也只是原封不动地对调第 0 行和第 2 行——模型根本分不清谁在追谁。
+在接下来的网络层里，模型对这 $T$ 个词向量的加工全靠矩阵乘法。而矩阵乘法是逐行独立计算的：如果你把输入序列里的 `"猫 追 狗"` 调换成 `"狗 追 猫"`，查表得到的无非是把第 0 行和第 2 行对调了一下。如果不引入额外的位置信息，后面的矩阵算出来的结果也只是原封不动地对调第 0 行和第 2 行——模型根本分不清谁在前面、谁在后面。
 
-### 03. 位置处理：模型如何区别顺序？
+### 03. 位置处理：模型如何区别词的先后顺序？
 
-为了让对顺序盲目的矩阵运算识别出先后次序，模型必须把每个词所处的下标位置 $t \in \{0, 1, \dots, T-1\}$ 刻进向量里。
+为了让对顺序盲目的矩阵运算识别出词的先后次序，模型必须把每个词所处的下标位置 $t \in \{0, 1, \dots, T-1\}$ 编码进向量里。
 
-不过，位置信息究竟在哪个时刻、以什么方式刻进去，两代 Transformer 做出了截然不同的选择——这也是初学者阅读真实开源模型源码时最容易迷路的地方：
+位置信息究竟在什么时候、用什么方式加进去？早期教科书模型和现代开源模型采用了两种不同的做法——这也是初学者看真实源码时最容易困惑的地方：
 
-1. **经典教科书方案（绝对位置编码，如初代 Transformer 与 GPT-2）**：直接在阶段 02 查表结束后动手。模型额外准备一张形状为 $[T_{\max}, d]$ 的位置参数矩阵 $\mathbf{W}_{\text{pos}}$（或正余弦公式表），取出前 $T$ 行得到 $[T, d]$，直接与词嵌入激活 $\mathbf{H}^{(0)}: [B, T, d]$ **逐元素相加**。相加之后，形状依然是 $[B, T, d]$，但每个向量内部已经混入了位置底色。
-2. **现代开源模型方案（旋转位置编码 RoPE，如 Llama、Qwen、Mistral）**：在阶段 02 查表结束后**什么都不加**，$\mathbf{H}^{(0)}$ 直接保持原样进入 Transformer 层；等到下一阶段（阶段 04）把隐藏状态投影并拆分成注意力查询 $\mathbf{Q}$ 和键 $\mathbf{K}$（形状为 $[B, h, T, d_h]$）之后，再根据每个位置 $t$ 的预设频率，把 $d_h$ 维向量里的分量两两配对，在二维平面上旋转 $t \cdot \theta$ 角。
+1. **早期教科书方案（绝对位置编码，如初代 Transformer 与 GPT-2）**：直接在阶段 02 查表结束后动手。模型额外准备一张形状为 $[T_{\max}, d]$ 的位置参数表 $\mathbf{W}_{\text{pos}}$，取出前 $T$ 行得到 $[T, d]$，直接与刚查出来的词向量 $\mathbf{H}^{(0)}: [B, T, d]$ **逐元素相加**。
+2. **现代开源模型方案（旋转位置编码 RoPE，如 Llama、Qwen、SmolLM2）**：在阶段 02 查表结束后**什么都不加**，$\mathbf{H}^{(0)}$ 直接保持原样进入 Transformer 层；等到下一阶段（阶段 04）把隐藏状态拆分成注意力查询向量 $\mathbf{Q}$ 和键向量 $\mathbf{K}$（形状为 $[B, h, T, d_h]$）之后，再按每个词所处的位置下标 $t$，把向量里的数字两两配成一对（当成二维平面上的坐标点），绕原点旋转 $t \cdot \theta$ 角。
+   **为什么旋转一下角度就能表达位置关系？** 因为后面算注意力时，第 $m$ 个词的 $\mathbf{Q}$ 和第 $n$ 个词的 $\mathbf{K}$ 要做内积（点乘），而两个旋转后的向量做点乘，结果只取决于它们之间的**夹角差 $(m - n)\theta$**——也就是两个词之间隔了几个词的**相对距离**！
+   （注：关于 RoPE 复数旋转与频率公式的完整数学推导，我们会在《第 2 篇｜深入 Transformer》里专门展开；在本篇中，你只需知道它在阶段 04 拆出 $\mathbf{Q}$ 和 $\mathbf{K}$ 后执行即可。）
 
-不管采用哪一种方案，有一条铁律是不变的：**位置处理只改变张量的数值，绝不改变张量的形状。**
+不管采用哪一种方案，有一条规律是不变的：**位置处理只修改张量里的数值，绝不改变张量的形状。**
 
 **本阶段对应的 `config.json` 超参数：**
 
 - `"max_position_embeddings": 8192`：定义最大上下文窗口长度 $T_{\max} = 8,192$（位置下标 $t \in [0, 8191]$）；
-- `"rope_theta": 100000`：定义旋转位置编码（RoPE）的逆频率底数 $\theta_{\text{base}} = 100,000$，各子空间维度的旋转角频率按 $\theta_i = \theta_{\text{base}}^{-2i/d_h}$ 计算；
-- `"rope_interleaved": false`：指定二维旋转分量的配对方式——`false` 代表采用 GPT-NeoX / Llama 标准的半区配对（将单头 64 维向量的前半区 `[0..32]` 与后半区 `[32..64]` 配对旋转），而非奇偶相邻下标交错配对；
-- `"rope_scaling": null`：表示在 `8,192` 原生窗口内直接使用原始频率公式，不启用线性内插或 YaRN 动态频率缩放。
+- `"rope_theta": 100000`：定义旋转位置编码（RoPE）的基础底数 $\theta_{\text{base}} = 100,000$，用来计算不同维度的旋转步长；
+- `"rope_interleaved": false`：指定二维旋转分量的配对方式——`false` 代表采用 Llama 标准的半区配对（将单头 64 维向量的前 32 个数与后 32 个数一一配对旋转）；
+- `"rope_scaling": null`：表示在 `8,192` 原生长度内直接使用原始旋转角度，不做额外的长度缩放。
 
-现在，带着身份与位置信息的初始隐藏状态 $\mathbf{H}^{(0)}: [B, T, d]$ 已经准备就绪，正式撞入第 0 层 Transformer Block 的核心引擎——多头自注意力层（Multi-Head Self-Attention）。
+现在，初始隐藏状态 $\mathbf{H}^{(0)}: [B, T, d]$ 已经准备完毕，正式进入第 0 层 Transformer 的第一个核心模块——多头自注意力层（Multi-Head Self-Attention）。
 
 ---
 
-## 五、 注意力机制的维度交响曲（阶段 04 — 06）
+## 五、 注意力机制是怎么算的：从 QKV 投影到多头合并（阶段 04 — 06）
 
 为什么我们需要注意力机制？
 
@@ -703,33 +709,44 @@ $$
 注意，**“拆头”这一步没有任何参数矩阵参与**，纯粹是对激活张量做了一次零成本的视图重排（Reshape）与维度交换（Transpose）：
 
 1. 先把最后一维 $d$ 拆成两个维度 $(h, d_h)$，形状从 $[B, T, d]$ 变成 $[B, T, h, d_h]$；
-2. 再把代表序列长度的维度 $T$（下标 1）和代表头数的维度 $h$（下标 2）对调（`transpose(1, 2)`），把 $B$ 和 $h$ 都推到前面充当批处理维度：
+2. 再把代表序列长度的维度 $T$（下标 1）和代表头数的维度 $h$（下标 2）对调（`transpose(1, 2)`），变成 $[B, h, T, d_h]$：
 
 $$
 \mathbf{Q}, \mathbf{K}, \mathbf{V} : [B, T, d] \xrightarrow{\text{Reshape}} [B, T, h, d_h] \xrightarrow{\text{Transpose}(1,2)} [B, h, T, d_h]
 $$
 
-（在现代 Llama / Qwen 模型中，此时还会紧接着对形状为 $[B, h, T, d_h]$ 的 $\mathbf{Q}$ 和 $\mathbf{K}$ 施加 RoPE 旋转位置编码，旋转后形状依然是 $[B, h, T, d_h]$。）
+**为什么要把头数 $h$ 换到序列长度 $T$ 前面？** 因为接下来每一个注意力头都要各自独立算一套“$T$ 个词对 $T$ 个词”的注意力矩阵（即 `[T, d_h] × [d_h, T] -> [T, T]`）。把 $B$ 和 $h$ 都放在最前面两维，硬件就能把这 $B \times h$ 个头当成互不干扰的独立批次任务一口气并行算完，而留在最后两维的永远是标准的 `[T, d_h]` 二维矩阵。
+
+（在现代 Llama / Qwen / SmolLM2 模型中，此时还会紧接着对形状为 $[B, h, T, d_h]$ 的 $\mathbf{Q}$ 和 $\mathbf{K}$ 施加 RoPE 旋转位置编码，旋转后形状依然是 $[B, h, T, d_h]$。）
 
 ### 05. 注意力计算与因果掩码：`[B, h, T, d_h]` $\to$ `[B, h, T, T]` $\to$ `[B, h, T, d_h]`
 
 现在，每个注意力头手里都有了一份形状为 $[T, d_h]$ 的查询表 $\mathbf{Q}$、键表 $\mathbf{K}$ 和值表 $\mathbf{V}$（外层套着 $[B, h]$）。
 
-第 $i$ 个位置的查询向量（长 $d_h$）怎样评估第 $j$ 个位置的键向量（长 $d_h$）跟自己有多匹配？最直接的几何工具就是**向量点积（Dot Product）**。把 $\mathbf{K}$ 的最后两个维度转置成 $\mathbf{K}^\top: [B, h, d_h, T]$，然后让 $\mathbf{Q}$ 与 $\mathbf{K}^\top$ 相乘，中间的维度 $d_h$ 在内积求和中被消掉了，长出了一个极其关键的方阵维度 $T \times T$：
+第 $i$ 个位置的查询向量（长 $d_h$）怎样评估第 $j$ 个位置的键向量（长 $d_h$）跟自己有多匹配？最直接的线性代数工具就是**向量点积（Dot Product）**——两个向量方向越接近，点积算出来的分数就越高。把 $\mathbf{K}$ 的最后两个维度转置成 $\mathbf{K}^\top: [B, h, d_h, T]$，然后让 $\mathbf{Q}$ 与 $\mathbf{K}^\top$ 相乘，中间的维度 $d_h$ 在点积求和中消掉了，生成了一个关键的方阵维度 $T \times T$：
 
 $$
 \mathbf{Q}\mathbf{K}^\top : [B, h, T, d_h] \times [B, h, d_h, T] \longrightarrow [B, h, T, T]
 $$
 
-为了防止 $d_h$ 较大时点积结果绝对值过大、导致后面的 Softmax 函数进入梯度饱和区，我们将每个分数除以常数 $\sqrt{d_h}$。
+为了防止 $d_h$ 较大时点积结果绝对值太大，我们将每个分数除以常数 $\sqrt{d_h}$（在 `SmolLM2` 中 $d_h = 64$，所以是除以 $\sqrt{64} = 8$）。
 
-但就在这时，我们撞上了 Decoder-only 语言模型最核心的铁律：**因果性（Causality）——过去不能偷看未来。**
+但就在这时，我们遇到了自回归语言模型最核心的一条规则：**因果性（Causality）——前面的词绝不能偷看后面的词。**
 
-在 $[T, T]$ 的分数方阵里，第 $i$ 行、第 $j$ 列的元素代表“第 $i$ 个词向第 $j$ 个词投去的关注度”。当 $j \le i$（对角线及左下角下三角区域）时，第 $i$ 个词是在看自己或自己前面的词，完全合法；但当 $j > i$（右上角上三角区域）时，第 0 个词已经在越界偷看第 1、第 2 个词了！如果不把这个漏洞堵死，模型在训练和预填充阶段就会直接抄袭标准答案。
+在 $[T, T]$ 的分数方阵里，第 $i$ 行、第 $j$ 列的元素代表“第 $i$ 个词向第 $j$ 个词投去的关注度”。当 $j \le i$（对角线及左下角下三角区域）时，第 $i$ 个词是在看自己或自己前面的词，完全合法；但当 $j > i$（右上角上三角区域）时，第 0 个词已经在越界偷看第 1、第 2 个词了！如果不把这个漏洞堵死，模型在训练时就会直接偷看后面的标准答案。
 
-堵住漏洞的工具叫**因果掩码（Causal Mask）** $\text{mask}$。它是一个形状为 $[T, T]$（可广播至 $[B, h, T, T]$）的固定矩阵：下三角及对角线（$j \le i$）全为 $0$，严格上三角（$j > i$）全为负无穷 $-\infty$。
+堵住漏洞的工具叫**因果掩码（Causal Mask）** $\text{mask}$。它是一个形状为 $[T, T]$ 的固定矩阵：下三角及对角线（$j \le i$）全为 $0$，右上角严格上三角（$j > i$）全为负无穷 $-\infty$。
 
-将它加到缩放后的分数矩阵上，再对每一行做 $\operatorname{softmax}$ 归一化（因为 $e^{-\infty} = 0$，所有未来位置的权重瞬间归零，而剩余合法位置的权重之和恰好等于 $1$）：
+将掩码加到缩放后的分数矩阵上，接着对每一行做 **$\operatorname{softmax}$ 归一化**，把原始分数变成加起来等于 $1$（100%）的概率权重。如果你之前没接触过 $\operatorname{softmax}$，它的计算公式其实只有两步：
+
+$$
+\operatorname{softmax}(x_i) = \frac{e^{x_i}}{\sum_{j} e^{x_j}}
+$$
+
+1. **先对这一行的每个分数求自然指数 $e^{x_i}$**：这一步同时解决了两个问题——第一，不管原来的分数是正数还是负数，$e^{x_i}$ 算出来永远是大于 $0$ 的正数；更重要的是，右上角那些被因果掩码盖成 $-\infty$ 的未来位置，因为 $e^{-\infty} = 0$，求完指数后直接变成了严格的 **$0$**！
+2. **再除以这一行所有 $e^{x_j}$ 的总和**：这样算出来的每一个数字都落在 $0 \sim 1$ 之间，且每一行的概率加起来严格等于 $1$。
+
+写成矩阵公式就是：
 
 $$
 \mathbf{A} = \operatorname{softmax}\left(\frac{\mathbf{Q}\mathbf{K}^\top}{\sqrt{d_h}} + \text{mask}\right), \qquad \text{Shape: } [B, h, T, T]
@@ -932,38 +949,63 @@ $$
 \end{bmatrix}
 $$
 
-请看第 1 行（`"喜欢"`）：在刚才的 Head 1 里，它对 `"我"` 和 `"喜欢"` 投去了完全均等的关注（`[0.5, 0.5, 0]`）；但在 Head 2 里，它对前一个词 `"我"` 的打分是 $2\sqrt{2} \approx 2.828$，而对自己的打分只有 $\sqrt{2} \approx 1.414$！经过 Softmax 后，Head 2 的权重矩阵 $\mathbf{A}^{(2)}$ 变成了：
+请看第 1 行（`"喜欢"`）：在刚才的 Head 1 里，它对 `"我"` 和 `"喜欢"` 投去了完全均等的关注（`[0.5, 0.5, 0]`）；但在 Head 2 里，它对前一个词 `"我"` 的打分是 $2\sqrt{2} \approx 2.828$，而对自己的打分只有 $\sqrt{2} \approx 1.414$！经过 Softmax 后，Head 2 的权重矩阵 $\mathbf{A}^{(2)}$ 与加权输出 $\mathbf{O}^{(2)}$（保留两位小数）变成了：
 
 $$
 \mathbf{A}^{(2)} \approx \begin{bmatrix}
 1.00 & 0.00 & 0.00 \\
 0.80 & 0.20 & 0.00 \\
-0.09 & 0.19 & 0.72
+0.09 & 0.18 & 0.73
 \end{bmatrix}, \qquad
 \mathbf{O}^{(2)} = \mathbf{A}^{(2)}\mathbf{V}^{(2)} \approx
 \begin{bmatrix}
 2.00 & 0.00 \\
-1.60 & 0.40 \\
-2.34 & 2.54
+1.61 & 0.39 \\
+2.38 & 2.56
 \end{bmatrix}
 $$
 
-同一个位置 $t=1$，Head 1 在平均吸收前两个词的特征，而 Head 2 则把 80% 的聚光灯打在了主语 `"我"` 身上。
+同一个位置 $t=1$，Head 1 在平均吸收前两个词的特征，而 Head 2 则把 80% 的权重分给了主语 `"我"`。
 
 ### 第四步：合并多头并乘上 $\mathbf{W}_O$（阶段 06）
 
 最后，把 Head 1 的输出 $\mathbf{O}^{(1)}: [3, 2]$ 和 Head 2 的输出 $\mathbf{O}^{(2)}: [3, 2]$ 左右拼回一个 $3 \times 4$ 矩阵（即完整形状 $[1, 3, 4]$）：
 
 $$
-\mathbf{O}_{\text{concat}} = \begin{bmatrix} \mathbf{O}^{(1)} & \mathbf{O}^{(2)} \end{bmatrix} =
+\mathbf{O}_{\text{concat}} = \begin{bmatrix} \mathbf{O}^{(1)} & \mathbf{O}^{(2)} \end{bmatrix} \approx
 \begin{bmatrix}
 2.00 & 1.00 & 2.00 & 0.00 \\
-1.50 & 1.50 & 1.60 & 0.40 \\
-1.20 & 1.40 & 2.34 & 2.54
+1.50 & 1.50 & 1.61 & 0.39 \\
+1.20 & 1.40 & 2.38 & 2.56
 \end{bmatrix}
 $$
 
-再右乘输出投影矩阵 $\mathbf{W}_O \in \mathbb{R}^{4 \times 4}$，就得到了注意力子层最终写回主干道的增量 $\Delta\mathbf{H}_{\text{attn}} \in \mathbb{R}^{[1, 3, 4]}$。每一格数字都来路清楚，没有任何魔法。
+再右乘输出投影矩阵 $\mathbf{W}_O \in \mathbb{R}^{4 \times 4}$，就得到了注意力子层最终写回主干道的增量 $\Delta\mathbf{H}_{\text{attn}} \in \mathbb{R}^{[1, 3, 4]}$。每一格数字都来路清楚，没有任何黑盒。
+
+### 第五步：在终端运行 `--mode toy`，核验我们的手算结果
+
+刚才我们用纸笔算出了 $\mathbf{Q}_{\text{raw}}, \mathbf{K}_{\text{raw}}, \mathbf{V}_{\text{raw}}$、两个头的注意力概率 $\mathbf{A}^{(1)}, \mathbf{A}^{(2)}$ 以及合并后的 $\mathbf{O}_{\text{concat}}$。现在打开终端，运行 `llm-tracer` 的第二个模式 `--mode toy`，让计算机用 32 位浮点数把上面这道题重算一遍：
+
+```bash
+cargo run -- --mode toy
+```
+
+终端会立即打印出如下结果，你可以拿它和我们刚刚手算的每一个数字逐一比对，分毫不差：
+
+```text
+=== Episode 0 Toy Hand-Calculation Verification (B=1, T=3, d=4, h=2, d_h=2) ===
+[02.Embedding  ] X (toy input states)                 | ACTIVATION | shape: [1, 3, 4]            | [+1.0000, +0.0000, +1.0000, +0.0000 ...]
+[04.AttnProj   ] Q_raw                                | ACTIVATION | shape: [1, 3, 4]            | [+2.0000, +0.0000, +1.0000, +1.0000 ...]
+[04.AttnProj   ] K_raw                                | ACTIVATION | shape: [1, 3, 4]            | [+1.0000, +1.0000, +2.0000, +0.0000 ...]
+[04.AttnProj   ] V_raw                                | ACTIVATION | shape: [1, 3, 4]            | [+2.0000, +1.0000, +2.0000, +0.0000 ...]
+
+--- Head 1 Attention Probs A^(1) [3x3] ---
+[[1.0, 0.0, 0.0], [0.5, 0.5, 0.0], [0.19777581, 0.40111208, 0.40111208]]
+--- Head 2 Attention Probs A^(2) [3x3] ---
+[[1.0, 0.0, 0.0], [0.8044297, 0.19557032, 0.0], [0.087948754, 0.17837015, 0.73368114]]
+--- Concatenated Output O_concat [3x4] ---
+[[2.0, 1.0, 2.0, 0.0], [1.5, 1.5, 1.6088594, 0.39114064], [1.1977758, 1.4011121, 2.376941, 2.5577836]]
+```
 
 ---
 
@@ -1013,11 +1055,9 @@ $$
 \mathbf{H}^{(0)} \xrightarrow{\text{Layer } 0} \mathbf{H}^{(1)} \xrightarrow{\text{Layer } 1} \mathbf{H}^{(2)} \longrightarrow \cdots \longrightarrow \mathbf{H}^{(L-1)} \xrightarrow{\text{Layer } L-1} \mathbf{H}^{(L)} \quad (\text{全程保持 } [B, T, d])
 $$
 
-这就像古代驿道上一卷尺寸固定的通关文牒，从第一座驿站传到第三十座驿站，羊皮纸的长宽分毫未变，但每一站驿丞都在上面加盖了自己的朱印与批注。
+第 0 层、第 1 层直到第 $L-1$ 层，虽然张量形状分毫未变，但每一层都拥有自己独立训练出的一套参数矩阵（$\mathbf{W}_Q^{(\ell)}, \mathbf{W}_K^{(\ell)}, \mathbf{W}_V^{(\ell)}, \mathbf{W}_O^{(\ell)}$ 以及各自的 MLP 权重）。浅层往往在建立局部的词法与短语搭配，中层在梳理跨句子的指代与逻辑结构，深层则在把信息逐步收敛到“接下来该预测什么词”的方向上。
 
-第 0 层、第 1 层直到第 $L-1$ 层，每一层都拥有自己独立的一套参数矩阵（$\mathbf{W}_Q^{(\ell)}, \mathbf{W}_K^{(\ell)}, \mathbf{W}_V^{(\ell)}, \mathbf{W}_O^{(\ell)}$ 以及各自的 MLP 权重）。浅层往往在建立局部的词法与短语搭配，中层在编织跨句子的指代与逻辑结构，深层则在把信息逐步收敛到“接下来该说什么词”的预测方向上。
-
-当激活张量走出最后一层（第 $L-1$ 层）并经过最后一道全局归一化（Final Norm）后，我们拿到了最终隐藏状态 $\mathbf{H}_{\text{final}}: [B, T, d]$。
+当激活张量走出最后一层（第 $L-1$ 层）并经过最后一道全局归一化（Final RMSNorm，即我们在开箱体检里看到的第 272 个张量 `model.norm.weight`）后，我们拿到了最终隐藏状态 $\mathbf{H}_{\text{final}}: [B, T, d]$。
 
 **本阶段对应的 `config.json` 超参数：**
 
@@ -1135,17 +1175,19 @@ use candle_core::{DType, Result, Tensor};
 pub enum Role {
     Weight,     // 静态参数矩阵：形状只含 (V, d, h, d_h, d_ff)，绝不含 B 与 T
     Activation, // 动态中间激活：形状必含批大小 B 与序列长度 T
+    KvCache,    // 键值缓存：跨步保存历史位置的 K 与 V 激活张量
 }
 
 pub fn trace(stage: &str, name: &str, role: Role, t: &Tensor) -> Result<()> {
     let role_tag = match role {
         Role::Weight => "WEIGHT    ",
         Role::Activation => "ACTIVATION",
+        Role::KvCache => "KV_CACHE  ",
     };
     let flat = t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-    let head: Vec<String> = flat.iter().take(3).map(|v| format!("{:+.4}", v)).collect();
+    let head: Vec<String> = flat.iter().take(4).map(|v| format!("{:+.4}", v)).collect();
     println!(
-        "[{:<12}] {:<24} | {} | shape: {:<18} | [{} ...]",
+        "[{:<14}] {:<38} | {} | shape: {:<20} | [{} ...]",
         stage,
         name,
         role_tag,
@@ -1176,89 +1218,47 @@ pub fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
 }
 ```
 
-在这三个原语之上，第 0 层 Transformer Block 的完整前向计算在 Rust 里只有不到 60 行：
+在这三个基础函数之上，单层 Transformer Block（以第 0 层为例）的完整前向计算在 `crates/llm-tracer/src/main.rs` 里只有不到 60 行，每一步都和我们前面讲过的阶段一一对应：
 
 ```rust
-pub fn forward_layer0_traced(
-    h_in: &Tensor,          // 输入隐藏状态: [B, T, 576]
-    w_norm1: &Tensor,       // model.layers.0.input_layernorm.weight: [576]
-    w_q: &Tensor,           // model.layers.0.self_attn.q_proj.weight: [576, 576]
-    w_k: &Tensor,           // model.layers.0.self_attn.k_proj.weight: [192, 576]
-    w_v: &Tensor,           // model.layers.0.self_attn.v_proj.weight: [192, 576]
-    w_o: &Tensor,           // model.layers.0.self_attn.o_proj.weight: [576, 576]
-    w_norm2: &Tensor,       // model.layers.0.post_attention_layernorm.weight: [576]
-    w_gate: &Tensor,        // model.layers.0.mlp.gate_proj.weight: [1536, 576]
-    w_up: &Tensor,          // model.layers.0.mlp.up_proj.weight: [1536, 576]
-    w_down: &Tensor,        // model.layers.0.mlp.down_proj.weight: [576, 1536]
-    cos: &Tensor,           // RoPE 余弦表: [T, 32] (即 d_h / 2)
-    sin: &Tensor,           // RoPE 正弦表: [T, 32]
-    eps: f32,
-) -> Result<Tensor> {
-    let (b, t, d) = h_in.dims3()?;
-    let (h_q, h_kv, d_h) = (9, 3, 64);
+    // 1. 进入注意力车间前：先做 Pre-RMSNorm 归一化校准
+    let x_norm = candle_nn::ops::rms_norm(&x, &w_in_norm, cfg.rms_norm_eps)?;
+    trace("03.PreRMSNorm", "X_norm (Layer 0)", Role::Activation, &x_norm)?;
 
-    // 阶段 04：Pre-RMSNorm 与 Q/K/V 线性投影及拆头
-    let h_norm1 = candle_nn::ops::rms_norm(h_in, w_norm1, eps)?;
-    trace("04.PreNorm", "h_norm1", Role::Activation, &h_norm1)?;
+    // 2. 阶段 04：Q / K / V 线性投影（乘上各自的权重矩阵）
+    let q_lin = linear_no_bias(&x_norm, &w_q)?; // [B, T, 576]
+    let k_lin = linear_no_bias(&x_norm, &w_k)?; // [B, T, 192] (3 个 KV 头 * 64)
+    let v_lin = linear_no_bias(&x_norm, &w_v)?; // [B, T, 192]
 
-    let q = linear_no_bias(&h_norm1, w_q)?
-        .reshape((b, t, h_q, d_h))?
-        .transpose(1, 2)?
-        .contiguous()?; // [B, 9, T, 64]
-    let k = linear_no_bias(&h_norm1, w_k)?
-        .reshape((b, t, h_kv, d_h))?
-        .transpose(1, 2)?
-        .contiguous()?; // [B, 3, T, 64]
-    let v = linear_no_bias(&h_norm1, w_v)?
-        .reshape((b, t, h_kv, d_h))?
-        .transpose(1, 2)?
-        .contiguous()?; // [B, 3, T, 64]
+    // 3. 阶段 03/04：拆头转置为 [B, h, T, 64]，并对 Q 和 K 施加 RoPE 旋转位置编码
+    let q = q_lin.reshape((b, t, h_q, d_h))?.transpose(1, 2)?.contiguous()?;  // [B, 9, T, 64]
+    let k = k_lin.reshape((b, t, h_kv, d_h))?.transpose(1, 2)?.contiguous()?; // [B, 3, T, 64]
+    let v = v_lin.reshape((b, t, h_kv, d_h))?.transpose(1, 2)?.contiguous()?; // [B, 3, T, 64]
 
-    trace("04.AttnProj", "W_Q (static)", Role::Weight, w_q)?;
-    trace("04.AttnProj", "W_K (static, GQA)", Role::Weight, w_k)?;
-    trace("04.AttnProj", "Q_split", Role::Activation, &q)?;
-    trace("04.AttnProj", "K_split (GQA 3 heads)", Role::Activation, &k)?;
+    let q_rope = candle_nn::rotary_emb::rope(&q, &cos, &sin)?; // [B, 9, T, 64]
+    let k_rope = candle_nn::rotary_emb::rope(&k, &cos, &sin)?; // [B, 3, T, 64]
 
-    // 阶段 03/04：施加半区配对 RoPE 旋转位置编码（形状不变）
-    let q_rope = candle_nn::rotary_emb::rope(&q, cos, sin)?;
-    let k_rope = candle_nn::rotary_emb::rope(&k, cos, sin)?;
-    trace("04.RoPE", "Q_after_rope", Role::Activation, &q_rope)?;
-
-    // 阶段 05：GQA 广播 KV 头 + 缩放点积 + 因果掩码 + Softmax
-    let k_rep = repeat_kv(&k_rope, h_q / h_kv)?; // [B, 3, T, 64] -> [B, 9, T, 64]
-    let v_rep = repeat_kv(&v, h_q / h_kv)?;      // [B, 3, T, 64] -> [B, 9, T, 64]
+    // 4. 阶段 05：将 3 个 KV 头复制扩展为 9 个头，计算缩放点积 + 因果掩码 + Softmax + 乘 V
+    let k_full = repeat_kv(&k_cache, h_q / h_kv)?; // [B, 3, S, 64] -> [B, 9, S, 64]
+    let v_full = repeat_kv(&v_cache, h_q / h_kv)?; // [B, 3, S, 64] -> [B, 9, S, 64]
 
     let scale = 1.0f64 / (d_h as f64).sqrt();
-    let scores = (q_rope.matmul(&k_rep.t()?)? * scale)?; // [B, 9, T, T]
-    trace("05.AttnScore", "scores (QK^T/sqrt(d_h))", Role::Activation, &scores)?;
-
+    let scores = (q_rope.matmul(&k_full.t()?)? * scale)?; // [B, 9, T, S]
     let masked_scores = apply_causal_mask(&scores)?;
-    let attn_probs = candle_nn::ops::softmax_last_dim(&masked_scores)?; // [B, 9, T, T]
-    trace("05.AttnProbs", "attn_probs (Softmax)", Role::Activation, &attn_probs)?;
+    let probs = candle_nn::ops::softmax_last_dim(&masked_scores)?; // [B, 9, T, S]
+    let context = probs.matmul(&v_full)?; // [B, 9, T, 64]
 
-    let context = attn_probs.matmul(&v_rep)?; // [B, 9, T, 64]
-    trace("05.AttnOut", "context (A @ V)", Role::Activation, &context)?;
-
-    // 阶段 06：多头合并与 W_O 输出投影 + 残差相加
+    // 5. 阶段 06：多头合并回 [B, T, 576]，乘 W_O 输出矩阵，并加回残差流
     let o_concat = context.transpose(1, 2)?.contiguous()?.reshape((b, t, d))?;
-    let delta_attn = linear_no_bias(&o_concat, w_o)?;
-    let h_mid = (h_in + &delta_attn)?;
-    trace("06.MergeOut", "h_mid (after Attn Res)", Role::Activation, &h_mid)?;
+    let attn_out = linear_no_bias(&o_concat, &w_o)?;
+    let h_mid = (&x + &attn_out)?; // 第一次残差相加
 
-    // 阶段 07：Pre-RMSNorm + SwiGLU MLP + 残差相加
-    let h_norm2 = candle_nn::ops::rms_norm(&h_mid, w_norm2, eps)?;
-    let gate = candle_nn::ops::silu(&linear_no_bias(&h_norm2, w_gate)?)?; // [B, T, 1536]
-    let up = linear_no_bias(&h_norm2, w_up)?;                             // [B, T, 1536]
-    let mlp_hidden = (&gate * &up)?;                                      // [B, T, 1536]
-    trace("07.MLP", "W_gate (static)", Role::Weight, w_gate)?;
-    trace("07.MLP", "mlp_hidden (SwiGLU)", Role::Activation, &mlp_hidden)?;
-
-    let delta_mlp = linear_no_bias(&mlp_hidden, w_down)?;                 // [B, T, 576]
-    let h_out = (&h_mid + &delta_mlp)?;                                   // [B, T, 576]
-    trace("07.MLPOut", "h_out (Layer 0 final)", Role::Activation, &h_out)?;
-
-    Ok(h_out)
-}
+    // 6. 阶段 07：进入 MLP 车间，Pre-RMSNorm + SwiGLU (gate * up -> down) + 第二次残差相加
+    let h_norm = candle_nn::ops::rms_norm(&h_mid, &w_post_norm, cfg.rms_norm_eps)?;
+    let gate = candle_nn::ops::silu(&linear_no_bias(&h_norm, &w_gate)?)?; // [B, T, 1536]
+    let up = linear_no_bias(&h_norm, &w_up)?;                             // [B, T, 1536]
+    let mlp_out = linear_no_bias(&(gate * up)?, &w_down)?;                // [B, T, 576]
+    let x_next = (&h_mid + &mlp_out)?; // 本层最终输出: [B, T, 576]
 ```
 
 ### 2. 真实运行记录：一眼看穿全局张量流向与真机吐字
@@ -1314,12 +1314,20 @@ cargo run -- --mode real
 [10.Decoded    ] Step 1 generated token 19556 -> "Hello"
 ```
 
-上面这张真机运行记录把整条链路里的每一类张量都落到了实处：
+上面这段真机运行日志信息量极大，我们把它的列格式和关键节点逐一拆开来看：
 
-1. **静态权重与动态激活泾渭分明**：凡是标着 `WEIGHT` 的行，形状里只有 `49152`、`576`、`192`、`1536`，完全看不到批大小 `1` 和序列长度 `10` 的踪影；而且 `[09.LM_Head]` 的权重前四个元素 `[-0.1060, +0.0342, +0.0476, -0.0239]` 与 `[02.Embedding]` 完全相同，因为它们指向物理内存里的同一个张量。
-2. **动态激活处处带着 $B=1, T=10$**：凡是标着 `ACTIVATION` 的行，无一例外以 `[1, 10, ...]`（或拆头后的 `[1, 9, 10, 64]`、GQA 键值头的 `[1, 3, 10, 64]`）开头。
-3. **手算规律在真机上严丝合缝重现**：在 `[05.Attention] Scores` 那一行，第 0 行的后三个元素全是 `-inf`（因果掩码屏蔽未来）；紧接着在 `Probs (Softmax)` 那一行，前四个数字是 `[+1.0000, +0.0000, +0.0000, +0.0000 ...]`——因此 `Context (Probs * V)` 的前四个数字 `[-0.0210, +0.0031, -0.0384, -0.0375]` 与 `V_lin` 的前四个数字分毫不差！这和我们在第六节用纸笔手算出的“位置 0 只能 100% 照抄 $\mathbf{v}_0$”完全一致。
-4. **真机开口说出第一个词**：穿过全部 30 层网络后，模型在阶段 10 从 `49,152` 个候选词得分中挑出最高分 `19556` 号，反查我们在前文打开过的 `tokenizer.json` 字典，刚好就是向用户回礼的英文单词 **`"Hello"`**！
+1. **每一行的四列分别代表什么？**
+   每一行追踪日志都按 **`[阶段名] 张量名 | 角色 (WEIGHT / ACTIVATION / KV_CACHE) | 形状 (shape) | [前 4 个浮点数切片 ...]`** 的格式打印。其中最右边方括号里的 4 个小数，是程序把该张量展平后取出的**最开头前 4 个真实数值**。例如你看第 3 行 `[02.Embedding] X_0` 的前三个数 `[-0.0255, -0.0192, -0.0396]`，正是第 1 个词元 `<|im_start|>`（Token ID `1`）从词嵌入表第 `1` 行查出来的真实浮点数！
+2. **静态权重与动态激活一眼可辨**：
+   凡是标着 `WEIGHT` 的行，形状里只有 `49152`、`576`、`192`、`1536` 这些架构常数，完全没有批大小 `1` 和序列长度 `10`；而且你看倒数第 5 行 `[09.LM_Head] lm_head.weight` 的前四个数 `[-0.1060, +0.0342, +0.0476, -0.0239]`，与第 2 行 `[02.Embedding] model.embed_tokens.weight` 完全相同——因为首尾共享了同一个矩阵。反过来，凡是标着 `ACTIVATION` 的行，形状无一例外带着批大小 `1` 和序列长度 `10`（如 `[1, 10, 576]`、拆成 9 个查询头后的 `[1, 9, 10, 64]`、3 个键值头的 `[1, 3, 10, 64]`）。
+3. **第六节的手算规律在真机上原样重现**：
+   看 `[05.Attention] Scores` 那一行，第 0 行的后三个元素全是 `-inf`（因果掩码把未来位置全部屏蔽）；紧接着在下一行 `Probs (Softmax)` 里，前四个数字变成了 `[+1.0000, +0.0000, +0.0000, +0.0000 ...]`——因此再下一行 `Context (Probs * V)` 的前四个数字 `[-0.0210, +0.0031, -0.0384, -0.0375]` 与前面 `V_lin` 的前四个数字分毫不差！这和我们在第六节用纸笔手算出的“第 0 个词只能 100% 吸收自己的 $\mathbf{V}$ 向量”完全一致。
+4. **为什么从第 0 层输出 `X_1` 直接跳到了第 30 层输出 `X_30`？**
+   在 `X_1 (Layer 0 output)` 之后，第 1 层到第 29 层在 `for layer_idx in 0..30` 循环里执行的矩阵运算和形状变化与第 0 层 100% 相同。为了避免在终端刷出七百多行重复形状的日志，探针完整展示了第 0 层的内部细节，随后静默跑完第 1 至 29 层及最终的 `model.norm.weight`，直接打印出走完 30 层后的总输出 `[08.RepeatL30] X_30`（形状依然是 `[1, 10, 576]`，但里面的数值已经变成了 `[-0.7521, -0.1531, ...]`）。
+5. **最后三行：真机是如何挑出第一个回答词 `"Hello"` 的？**
+   - 在 `[09.LM_Head]`，30 层算完的 `X_30`（`[1, 10, 576]`）乘上转置后的词嵌入矩阵（`[576, 49152]`），算出了全部 10 个位置在 49,152 个候选词上的得分 `Logits`（形状 `[1, 10, 49152]`）；
+   - 在 `[10.SelectNext]`，程序只切出最后一行（即第 10 个词元 `\n` 所在位置，形状 `[49152]`），在 49,152 个候选得分里找出最大值（`Greedy argmax`），发现得分最高的是第 **`19556`** 号（得分高达 `+31.8`）；
+   - 在 `[10.Decoded]`，拿整数 `19556` 去反查我们在第二节打开过的 `tokenizer.json` 词表，第 `19556` 号词元恰恰就是向用户问好的英文单词 **`"Hello"`**！
 
 ---
 
