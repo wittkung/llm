@@ -1,65 +1,46 @@
 # 第零篇｜大模型推理全流程：从文本到下一个 Token
 
-大语言模型在计算机里究竟是什么？很多人都知道 LLM 是在预测下一个词，里面有成百上千亿甚至上万亿的参数，参数大概是个矩阵，维度非常高。但它究竟是如何工作的？它内部究竟由哪几个部分组成、有几个参数矩阵？我们敲进去的一句输入文本，又是怎样一步步穿过这些矩阵、最终变成下一个输出词的？
+大语言模型在计算机内部究竟是什么？我们输入的一句文本，又是怎样穿过一层层参数矩阵、最终变成下一个输出词的？
 
-今天我们将把这一切讲明白。作为整套系列的**第零篇（总览篇）**，我们基于 **Rust 工具链**，以开源模型 **`SmolLM2-135M-Instruct`**（标准 Llama 仅解码器架构，1.35 亿参数、共 272 个权重张量、单文件 269 MB，普通笔记本 CPU 即可毫秒级运行）为例，走通一次完整前向计算的 11 个阶段；在文章后半部分，我们还将横向对比目前最前沿的工业级大模型——如 **`DeepSeek-V4.1-Flash-1017`**——看看最先进的架构与今天所学的基准模型究竟有什么区别。
+作为本系列的总览篇，我们基于 **Rust 工具链**，以开源模型 `SmolLM2-135M-Instruct`（标准 Llama 架构，1.35 亿参数、272 个权重张量、体积 269 MB）为基准标本，完整追踪一次前向推理的 **11 个计算阶段**；并在文末对标工业界前沿模型 `DeepSeek-V4.1-Flash-1017` 与机械可解释性理论。
 
-别担心，你不需要深厚的 Rust 功底，只需要有基本的编程直觉和基础的线性代数知识即可。如果你对矩阵乘法的维度消去规律还不熟，或者此前从未接触过 Rust，可以先花 20 分钟阅读专门为你准备的 **[《前置篇｜线性代数与 Rust 极简入门》](../ep-pre-math-and-rust/draft.md)**。
-
-本文的配套 GitHub 仓库链接在这：[https://github.com/wittkung/llm](https://github.com/wittkung/llm)，可以克隆或下载代码自己跑跑看！
+- **前置准备**：若你对矩阵维度消去律或 Rust 语法尚不熟悉，建议先阅读 [《前置篇｜线性代数与 Rust 极简入门》](../ep-pre-math-and-rust/draft.md)。
+- **配套仓库**：[https://github.com/wittkung/llm](https://github.com/wittkung/llm)
 
 ---
 
 ## 一、 为什么用 Rust 追踪大模型？
 
-谈论大模型原理的文章十有八九用 Python 写成。只需五行 PyTorch 代码，任何人都能调起一个开源模型完成对话；但也是这五行代码，把初学者挡在了真正的计算过程之外——代码越省事，底层的矩阵变形与数据流动就越像黑盒。
+仅需五行 Python 代码即可调用开源模型完成对话，但高度封装的接口也掩盖了底层的张量变形与内存流转。
 
-更耐人寻味的是，哪怕一个工程师每天只写 Python，当他真正跑起一次大模型推理或使用前沿 AI 工具时，在底层干重活的早就换成 Rust 了：
+而在工业界生产环境中，大模型基础设施的核心组件早已转向 Rust：
 
-- 你在终端里用的 AI 编程助手，比如 OpenAI 官方的 **Codex**、新一代 AI 编辑器 **Zed**，核心全是直接用 Rust 写的；**Claude Code** 能在几毫秒内搜遍整个代码库、**Cursor** 能瞬间完成代码语义检索，背后靠的也是 Rust 编写的检索引擎；
-- 就算回到最日常的 Python 环境，当你调用 OpenAI 的 `tiktoken` 或 Hugging Face 的 `tokenizers` 给文本分词、用 `safetensors` 加载模型权重、用 `Pydantic` 校验大模型返回的 JSON、甚至用 `uv` 安装环境时，Python 只是外面一层薄薄的调用壳，底下真正吞吐字节与矩阵的内核全是用 Rust 写的。
+- **终端与编辑器工具**：OpenAI 官方 CLI `Codex`、AI 编辑器 `Zed`，以及 `Claude Code` 与 `Cursor` 的底层代码检索引擎均由 Rust 编写。
+- **Python 生态底层内核**：日常调用的 `tokenizers` 分词器、`safetensors` 权重加载器、`Pydantic` 校验核心与 `uv` 包管理器，底层全部是 Rust 实现。
 
-Python 对于简洁的调用和快速实验更加方便，但业界的生产端已经大刀阔斧地开始转向 Rust。为什么大家都在往 Rust 迁移？它到底优秀在哪里？
+### 1. 零 GC 开销与编译期内存安全
 
-### 1. 性能与内存安全
+大模型推理涉及高频分词、几十 GB 权重的零拷贝内存映射（`mmap`）以及高并发流式调度。
 
-大模型落地时，分词器每秒要切分上百万个词，加载器要把几十 GB 的权重文件直接零拷贝映射（`mmap`）进内存，智能体网关要同时并发调度成百上千条流式连接。
+Python 受限于解释器开销与全局解释器锁（GIL）；C/C++ 则容易引入内存越界与多线程数据竞争。Rust 通过编译期**所有权（Ownership）**与**借用检查（Borrow Checker）**，在不依赖垃圾回收（GC）的前提下，从编译阶段消除了内存与并发安全隐患。
 
-在这些高吞吐底层任务上，Python 受限于解释器开销与全局解释器锁（GIL），往往力不从心；而过去写底层唯一能选的 C/C++，稍微一不留神就会踩中数组越界、内存泄漏或多线程数据竞争的深坑。
+### 2. 基于 LLVM 的原生跨平台编译
 
-Rust 靠独特的编译期所有权（Ownership）与借用检查，**既不需要垃圾回收（避免 GC 暂停），又在编译阶段彻底保证了内存与多线程并发安全**。
+Rust 无需像 Python 或 Java 那样在目标机器上配置庞大的解释器或虚拟环境，其跨平台能力建立在三层编译器机制之上：
 
-### 2. 原生跨平台编译
-
-以前想让代码跨平台，像 Python 或 Java 必须在目标机器上预先安装庞大的解释器或虚拟机（JVM），换台电脑经常因为缺少动态链接库（`.dll` / `.so` / `.dylib`）或环境版本冲突而报错；而 C/C++ 的跨平台编译又常年受困于各家操作系统头文件与构建系统的兼容问题。
-
-Rust 通过三层编译器工程设计解决了这个问题：
-
-- **基于 LLVM 的编译器架构（一套源码，直出各平台原生机器码）**：
-  什么是 **LLVM**？它是当今工业界最核心的开源**编译器后端基础设施（Compiler Infrastructure）**。包括苹果的 Swift、C/C++ 的现代编译器 Clang、乃至英伟达的 CUDA 编译器（NVVM），底层全都建立在 LLVM 之上。
-  现代编译器分为**前端（Frontend）**和**后端（Backend）**。为了避免让每门语言重复编写生成几十种 CPU 指令集的代码，LLVM 在中间定义了一套与具体编程语言和具体硬件都无关的通用底层指令集，称为 **LLVM IR（Intermediate Representation，中间表示）**。
-  当你编译 Rust 代码时，Rust 编译器前端（`rustc`）先完成类型与内存安全检查，把源码翻译成标准的 **LLVM IR**；随后交由 **LLVM 后端**执行循环向量化、内联等深度优化，并直接针对目标硬件架构——无论是苹果 M 系列的 ARM64 指令集（`aarch64`）、Windows 与 Linux 的 x86_64 指令集，还是可在浏览器中直接运行的 **WebAssembly（`wasm32`）**——生成 100% 原生的机器指令。
-- **编译期条件编译（Conditional Compilation, `#[cfg(...)]`）**：
-  不同操作系统的虚拟内存映射（`mmap`）、线程调度以及硬件矩阵加速库接口完全不同。Rust 允许在源码和 `Cargo.toml` 中通过 `cfg` 属性，在**编译期**按目标平台自动裁剪并挂载对应的系统原生接口。
-  例如在我们今天配套代码的 `Cargo.toml` 中，只需声明一行 `[target.'cfg(target_os = "macos")'.dependencies]`，在 macOS 上编译时就会自动链接苹果原生的 `Accelerate` 矩阵运算框架，而在 Windows 和 Linux 上编译时则自动切换为通用 CPU 或 CUDA 算子——上层业务代码一行都不用改。
-- **静态链接与单文件分发**：
-  编译完成后，所有第三方依赖库默认被静态链接进同一个只有几 MB 的独立可执行文件中（Windows 下为 `.exe`，macOS/Linux 下为原生 Mach-O/ELF 二进制文件）。它不依赖目标机器上的任何外部环境，彻底告别了 Python 动辄好几个 GB、换台机器就报错的依赖环境地狱。
-
-所以，我们这个系列就用 Rust 来完成——没有黑盒，把所有中间过程都彻底搞懂、搞清楚。
-
-在正式进入模型内部之前，我们先花三分钟把实验环境搭好，把模型真正下载到你自己的电脑硬盘里，边跑代码边往下看。
+- **LLVM 中间表示（LLVM IR）**：编译器前端 `rustc` 先将源码转化为硬件无关的 LLVM IR，再由 LLVM 后端直接针对 Apple Silicon（`aarch64`）、x86_64 或 WebAssembly（`wasm32`）生成原生机器码。
+- **编译期条件编译（`#[cfg(...)]`）**：可在编译阶段按操作系统自动挂载硬件加速库（如 macOS 自动链接 `Accelerate` 矩阵框架，Linux/Windows 自动切换通用 CPU 或 CUDA 算子）。
+- **静态链接单文件分发**：所有依赖默认静态编译为单一原生可执行文件，彻底告别动态库缺失与环境冲突。
 
 ---
 
 ## 二、 环境准备与模型文件拆解
 
-整个实验不需要安装 Python、Conda 或任何庞大的深度学习全家桶，只需要配置好 Rust 工具链，再下载三个核心模型文件即可。
+本实验无需安装 Python 或 Conda，仅需配置 Rust 工具链并下载三个模型文件。
 
 ### 1. 安装 Rust 工具链
 
-如果你电脑上已经装过 Rust，可以直接跳到下一小节。
-
-**macOS / Linux / Windows WSL 用户**打开终端，复制并运行下面这三行官方命令：
+**macOS / Linux / WSL 终端：**
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -67,41 +48,33 @@ source "$HOME/.cargo/env"
 cargo --version
 ```
 
-如果你平时很少和终端脚本打交道，不用被这串符号吓到，这三行命令做的事情非常单纯：
+- 第 1 行拉取官方安装脚本，出现提示时按回车（Enter）选择默认安装；
+- 第 2 行刷新当前终端的环境变量路径；
+- 第 3 行验证构建系统与包管理器 `cargo` 是否就绪。
 
-1. **第 1 行（下载并运行安装器）**：用 `curl` 通过加密的 HTTPS 协议从 Rust 官网（`sh.rustup.rs`）拉取安装脚本，并通过管道符 `|` 直接交给终端（`sh`）执行。运行后屏幕上会弹出一个英文确认菜单，直接按一下**回车键（Enter）**选择默认安装即可。
-2. **第 2 行（刷新当前窗口的环境变量）**：安装器会把工具装在你个人目录下的 `.cargo/bin` 文件夹里。执行 `source "$HOME/.cargo/env"` 是为了告诉当前终端窗口立即加载刚装好的命令路径，这样不用重启终端就能直接使用。
-3. **第 3 行（验证构建系统与包管理器 `cargo`）**：`cargo` 是 Rust 官方的**构建系统与包管理器（Build System & Package Manager）**，它把第三方依赖的解析下载（类似 Python 的 `pip/uv`）和调用编译器 `rustc` 编译代码（类似 C++ 的 `CMake`）整合在了同一个工具里。只要终端打印出类似 `cargo 1.85.0 (...)` 的版本号，就说明工具链已经配置完成。
-
-**原生 Windows 用户（PowerShell）**不需要配置 WSL 也能直接运行。你既可以去官网 [`https://rustup.rs`](https://rustup.rs) 下载 [`rustup-init.exe`](https://win.rustup.rs/x86_64) 双击安装，也可以打开 **PowerShell** 运行 Windows 官方包管理器命令：
+**Windows PowerShell：**
 
 ```powershell
 winget install Rustlang.Rustup
 ```
 
-需要注意：Rust 在 Windows 下编译程序需要调用系统的底层 C++ 链接器。如果你的电脑以前没装过 Visual Studio C++ 工具链，运行 `rustup-init.exe` 时它会提示缺少 C++ 环境，并给出默认选项 `1) Quick install via the Visual Studio Community installer`。你只需**一路按回车（Enter）**，它就会自动调用微软官方安装器把所需的 C++ 组件装好。安装结束后，**关掉当前的 PowerShell 窗口重新打开一个新的**，输入 `cargo --version` 看到版本号即告成功。
+若系统未安装 Visual Studio C++ 链接器，安装器会自动提示 `1) Quick install via the Visual Studio Community installer`，直接按回车自动配置即可。完成后重开 PowerShell 窗口运行 `cargo --version`。
 
-### 2. 认识 Hugging Face 与模型文件
+### 2. 三个核心模型文件
 
-如果你是第一次接触开源大模型，可能会好奇：**Hugging Face** 到底是什么？
+Hugging Face（[huggingface.co](https://huggingface.co)）是开源模型权重的标准托管平台。在 `HuggingFaceTB/SmolLM2-135M-Instruct` 仓库中，驱动推理只需下载三个核心文件：`config.json`、`tokenizer.json` 与 `model.safetensors`。
 
-简单来说，如果 GitHub 是全世界程序员托管源代码的大本营，那么 **Hugging Face**（官网 [`huggingface.co`](https://huggingface.co)）就是全球 AI 界的“模型版 GitHub”。普通代码文件只有几 KB，但训练好的大模型权重动辄几百 MB 甚至几百 GB，普通代码仓库根本装不下。于是，包括 DeepSeek、阿里 Qwen、Meta Llama 在内的全球各大实验室，在模型训练完成后都会把权重文件、词表和配置文件按统一标准上传到 Hugging Face 开源分享。
+#### （1）config.json：架构超参数
 
-我们今天要用的 **`HuggingFaceTB/SmolLM2-135M-Instruct`**，命名格式就和 GitHub 仓库完全一致：斜杠前面的 `HuggingFaceTB` 是发布团队名称（Hugging Face 官方预训练团队），斜杠后面的 `SmolLM2-135M-Instruct` 则是这套 1.35 亿参数对话模型的仓库名。
-
-当你点开这个模型仓库的文件列表页面时，会看到十来个文件。它们只分两类：**真正驱动推理的核心三件套**（`config.json`、`tokenizer.json`、`model.safetensors`，本次实验只需下载这三个），以及**外围兼容与说明文件**。我们先把它们挨个看懂。
-
-#### （1）config.json：架构配置
-
-那份 269 MB 的权重文件是紧凑排列的二进制浮点数，无法用文本编辑器直接阅读；而这份不到 1 KB 的 `config.json` 则以纯文本 JSON 记录了模型的全部**架构超参数（Architectural Hyperparameters）**。无论人类工程师还是推理框架，加载一个模型的第一步永远是先解析 `config.json`：
+`config.json` 以纯文本记录了决定网络拓扑与张量形状的全部**架构超参数（Architectural Hyperparameters）**：
 
 ```json
 {
   "architectures": ["LlamaForCausalLM"],
   "model_type": "llama",
-  "vocab_size": 49152,                   // 👈 先看第 1 个指标：词表大小 V = 49,152
-  "hidden_size": 576,                    // 👈 先看第 2 个指标：隐藏层（词向量）维度 d = 576
-  "num_hidden_layers": 30,               // 👈 先看第 3 个指标：Transformer 网络总层数 L = 30
+  "vocab_size": 49152,
+  "hidden_size": 576,
+  "num_hidden_layers": 30,
   "num_attention_heads": 9,
   "num_key_value_heads": 3,
   "intermediate_size": 1536,
@@ -109,199 +82,98 @@ winget install Rustlang.Rustup
   "max_position_embeddings": 8192,
   "rope_theta": 100000,
   "rms_norm_eps": 1e-05,
-  "attention_bias": false,
-  "mlp_bias": false,
   "tie_word_embeddings": true,
   "bos_token_id": 1,
   "eos_token_id": 2,
-  "torch_dtype": "bfloat16",
-  "use_cache": true
+  "torch_dtype": "bfloat16"
 }
 ```
 
-第一次打开它，你完全不需要急着看懂里面的每一个字段。我们先看标了箭头的三个核心超参数：词表里有 `49,152` 个词元（`vocab_size`），每个词元在模型内部用 `576` 个浮点数表示（`hidden_size`），一共要依次穿过 `30` 层 Transformer 网络（`num_hidden_layers`）。至于剩下的其他参数，我们会在后文对应的计算阶段逐一揭示；等你读到文章末尾，这二十几行配置将全部水落石出。
+各字段对应的数学符号与所作用的推理阶段如下表所示（阅读后文各阶段时可随时回查）：
 
-围绕着 `"hidden_size": 576`，我们先解决两个最直接的疑问：
+| JSON 字段 | 符号与数值 | 作用阶段 | 核心含义 |
+|---|---|---|---|
+| `vocab_size` | $V = 49,152$ | 阶段 01, 02, 09 | 词表词元总数（Token ID 范围 `0..49151`） |
+| `hidden_size` | $d = 576$ | 全流程主干 | 隐藏状态（残差流）的特征向量维度 |
+| `num_hidden_layers` | $L = 30$ | 阶段 08 | 串联堆叠的 Transformer 层数 |
+| `num_attention_heads` | $h_q = 9$ | 阶段 04 — 06 | 查询（Query）注意力头数，单头维度 $d_h = 576 / 9 = 64$ |
+| `num_key_value_heads` | $h_{kv} = 3$ | 阶段 04 — 06 | 键值（Key/Value）头数，构成 3:1 分组查询注意力（GQA） |
+| `intermediate_size` | $d_{ff} = 1536$ | 阶段 07 | SwiGLU 前馈网络的中间升维宽度 |
+| `rope_theta` | $\theta = 100,000$ | 阶段 03 | 旋转位置编码（RoPE）的几何级数基频 |
+| `rms_norm_eps` | $\epsilon = 10^{-5}$ | 阶段 07, 08 | RMSNorm 分母防除零平滑常数 |
+| `tie_word_embeddings` | `true` | 阶段 02, 09 | 入口词嵌入矩阵与出口 LM Head 共享同一张权重表 |
+| `torch_dtype` | `bfloat16` | 磁盘存储 | 权重采用 16 位脑浮点数（每参数占 2 字节） |
 
-**第一，为什么每个词元要用 `576` 个数字来表示，而不是只用 1 个数字？**
+围绕 `"hidden_size": 576`，有两个关键设计逻辑：
 
-分词器给每个词分配的整数编号（Token ID，例如 `19556`）只是一个离散的**查表索引（Index）**，编号本身的大小没有任何数学或语义含义。为了让神经网络能够通过矩阵乘法计算词与词之间的语法、语义和上下文相关性，必须把每个离散的词元映射到高维连续向量空间中——在机器学习里，这叫做**分布式表示（Distributed Representation / Embedding）**。
+- **分布式表示（Distributed Representation）**：离散的整数词号无法直接求导或表达语义距离；将每个词映射为 576 维连续实数向量后，神经网络即可通过线性代数运算度量词法、句法与语境特征。
+- **硬件寄存器对齐**：576 在注意力层被均分为 $h_q = 9$ 个头，单头维度 $d_h = 576 \div 9 = 64$。现代 CPU SIMD 与 GPU Tensor Core 在维度为 $32, 64, 128$ 等 **$2$ 的整数次幂**时计算吞吐率最高。
 
-在 576 维空间里，每一个维度代表一个连续的特征方向。通过 576 个浮点数的线性组合，模型就能同时编码一个词的词性、语义类别与语境特征。模型的参数规模越大，这个隐藏层维度 $d$ 通常越高（例如 1.35 亿参数的本模型为 `576` 维，70 亿参数模型通常为 `4096` 维，而 5520 亿参数的 `DeepSeek-V4.1` 则为 `5120` 维）。
+#### （2）tokenizer.json：子词分词器与词表
 
-**第二，为什么偏偏是 `576` 这个数，而不是凑整的 `500`？**
+为什么输入文本要先做**子词分词（Subword Tokenization）**？
 
-这由下一行的 `"num_attention_heads": 9`（**注意力头数 $h_q = 9$**）与底层硬件的寄存器对齐规则共同决定。至于“注意力头”具体是什么，我们在第五节会专门拆解，这里你先不用管它的机制，只需看它的算术拆分关系。
+若按整句编号，人类句子无穷无尽，词表无法穷举；若按单字符切分，不仅单字符缺乏独立语义，还会使序列长度 $T$ 暴涨，导致复杂度为 $O(T^2)$ 的注意力计算崩溃。
 
-在注意力层中，模型会把长度为 `576` 的向量均匀拆分成 `9` 份（即 9 个注意力头）并行处理，每个头分到的**单头子空间维度（Head Dimension, $d_h$）**恰好是 $576 \div 9 = 64$。而在现代 CPU 的 SIMD 向量指令集与 GPU 的 Tensor Core 硬件单元中，矩阵乘法在维度为 `32`、`64`、`128` 这类 **$2$ 的整数次幂**时才能达到最高的内存对齐效率与指令吞吐率。因此，`576` 正是由 **$9\text{ 个头} \times 64\text{ 维/头}$** 乘出来的，一分不多、一分不少。
-
-那么，每个词里的这 576 个浮点数究竟存在哪里？它们又是怎么定出来的？我们接着看下面两个文件，答案立刻揭晓。
-
-#### （2）tokenizer.json：分词器与词表
-
-刚刚我们在 `config.json` 里看到了 `"vocab_size": 49152`。在打开分词器文件之前，我们先厘清一个最基础的概念：**什么是“切词（分词 / Tokenization）”？为什么要切词？**
-
-平时我们输入给模型的是一整句连续的字符串（例如 `"Hello!"` 或 `"我喜欢写代码"`）。计算机在把它送入神经网络之前，第一步必须先把整句话切分成一个个基本片段（每个片段称为一个 **Token / 词元**），这个过程就叫**切词（分词）**。
-
-为什么要做切词，既不直接按“整句话”编号，也不干脆按“单个字母/字符”编号？
-
-- **为什么不按“整句话”编号？** 因为人类能组合出的句子是无穷无尽的，没有任何词表能把世上所有可能的句子提前收录进去。
-- **为什么不按“单个字母或字节”编号？** 如果把英文单词 `"unbelievable"` 硬拆成 12 个独立字母，一方面单个字母 `'u'`、`'n'` 本身几乎不携带独立语义，模型极难从中学习语义规律；另一方面这会让一句话切出来的序列长度 $T$ 暴涨好几倍，而后面注意力层的计算量是随序列长度呈平方级（$O(T^2)$）增长的，算力会被瞬间拖垮。
-- **子词分词（Subword Tokenization）的折中解法**：研发人员通过统计海量语料，把最常用的完整单词（如 `"Hello"`、`"user"`）、高频词根词缀（如 `"ing"`、`"able"`）以及基础单字符浓缩成一张包含 `49,152` 个条目的有限**词表（Vocabulary）**，并给每个词元分配一个从 `0` 到 `49,151` 的唯一整数索引（**Token ID**）。无论输入什么句子，分词器都会查这张表将其切分为一串词元序列：常见词直接保留整词（如 `"Hello"` 切为 1 个词元），生僻长词则拆成几个已知词根的组合。这样既能用 `49,152` 个有限词元零遗漏地拼出世上任意文本，又能把一句话切出来的词元个数 $T$ 压到最短。
-
-如果你用文本编辑器打开 `models/SmolLM2-135M-Instruct/tokenizer.json`，就能直接看到这张 `49,152` 词表的真实 JSON 结构（文件遵循 GPT-2 字节级 BPE 规范，用特殊可见字符 `Ċ` 表示换行符 `\n`，用 `Ġ` 表示前导空格 `0x20`）：
+字节对编码（BPE）采取了折中路线：统计语料高频片段，将常用整词、词根词缀与基础字符浓缩为一张 $V = 49,152$ 的有限词表：
 
 ```json
 {
   "model": {
     "type": "BPE",
     "vocab": {
-      "<|endoftext|>": 0,      // 0 ~ 16 号：预留给控制对话边界与代码格式的特殊词元 (Special Tokens)
-      "<|im_start|>": 1,       // 1 号：对应 config.json 中的 bos_token_id: 1（单轮消息起始标记）
-      "<|im_end|>": 2,         // 2 号：对应 config.json 中的 eos_token_id: 2（单轮消息终止标记）
-      "!": 17,                 // 17 号起：ASCII 基础标点符号、数字与单字节字符
-      "0": 32,
-      "Ċ": 198,                // 198 号：换行符 (\n)
-      "Ġis": 314,              // 314 号：带前导空格的高频词 " is"
-      "user": 4093,            // 4093 号：子词 "user"
-      "Hello": 19556,          // 19556 号：子词 "Hello"
-      "ĠRust": 36828,          // 36828 号：带前导空格的子词 " Rust"
-      "ectable": 49151         // 49151 号：词表末尾词元（索引范围 0..49151，共 49,152 个）
+      "<|endoftext|>": 0,
+      "<|im_start|>": 1,
+      "<|im_end|>": 2,
+      "!": 17,
+      "Ċ": 198,
+      "user": 4093,
+      "Hello": 19556,
+      "ĠRust": 36828,
+      "ectable": 49151
     },
-    "merges": [
-      "Ġ t", "Ġ a", "i n", "h e", "Ġ Ġ", "r e", "o n", "e r", "Ġt he", "a t"
-      // ... 按优先级排列的 BPE 子词合并规则（例如第 3 条将相邻字符 "i" 与 "n" 合并为子词 "in"）
-    ]
+    "merges": ["Ġ t", "Ġ a", "i n", "h e", "Ġ Ġ", "r e"]
   }
 }
 ```
 
-看到这里，你一定会产生一个疑问：**为什么上面说每个词是由 `576` 个浮点数构成的向量，而这里的 `tokenizer.json` 词表里，每个词（比如 `"Hello": 19556`）却只有一个简单的整数？那个向量到底是 $1 \times 576$ 还是 $576 \times 1$？那 576 个数字究竟存在哪里？这两者是什么关系？**
+> **词号与向量的分工**：`tokenizer.json` 仅维护 **`字符串 <-> 整数行号（Token ID）`** 的双向字典（体积仅 2.0 MB），并不存储那 576 个浮点数。真正的浮点数向量存储在 `model.safetensors` 的第一张矩阵 `model.embed_tokens.weight`（形状 `[49152, 576]`）中——整数 Token ID 就是去该矩阵抽取值向量的**行下标**。
 
-把这三个核心文件连起来看，它们之间的分工与矩阵关系就彻底清楚了：
+#### （3）model.safetensors：静态参数张量
 
-**第一，`tokenizer.json` 里的单个整数（如 `19556`），本质上只是一个“行号（Row Index）”。**
+`model.safetensors` 存储了模型全部 **272 个静态参数张量**（共 `134,515,008` 个参数）：
 
-`tokenizer.json` 里根本不存储那 576 个浮点数。它的职责非常纯粹：只负责维护 **`"文本词元" <-> 整数行号（Token ID）`** 的双向字典（例如把 `"Hello"` 映射为整数 `19556`，把 `"!"` 映射为整数 `17`，总计 `0..49151` 共 `49,152` 个行号）。
+- **BF16 浮点格式**：每个参数采用 2 字节的 **BF16（Brain Floating Point 16）** 存储（1 位符号 + 8 位指数 + 7 位尾数），保留了与 32 位浮点数（FP32）相同的动态范围以防矩阵连乘溢出，同时将文件体积压缩至 $134,515,008 \times 2\text{ Bytes} \approx \mathbf{269.03\text{ MB}}$。
+- **参数的来源与生命周期**：所有权重在预训练之初均由标准差为 $1/\sqrt{d} \approx 0.04167$ 的正态分布随机初始化；在预训练阶段通过预测下一词的交叉熵损失与**反向传播（Backpropagation）**迭代更新；而在我们今天运行的**推理阶段**，全部 272 个张量永久冻结、只读不改。
 
-**第二，那 `576` 个浮点数，真正存储在第三个文件 `model.safetensors` 的第一张二维矩阵 `model.embed_tokens.weight` 里。**
-
-在 `model.safetensors` 中，存放着全模型的第一张权重矩阵，形状为 **`[49152, 576]`**（即 **49,152 行 $\times$ 576 列**）。它的**行数（49,152 行）**与 `tokenizer.json` 里的词表大小严格一一对应：第 `0` 行属于 `0` 号词元 `<|endoftext|>`，第 `19556` 行就属于 `19556` 号词元 `"Hello"`。
-
-它的**每一行（576 列）**横着连续存放了 576 个浮点数，即单个词元对应一个 `[1, 576]` 的行向量。当输入包含 $T$ 个词的一句话时，程序按行号抽出 $T$ 行上下叠成 `[T, 576]`；再加上同时处理 $B$ 条句子的批次维度（单条句子实验时 $B = 1$），就构成了流过模型主干的三维张量 **`[B, T, 576]`**。
-
-**第三，`tokenizer.json` 与 `model.safetensors` 是如何一进一出打配合的？**
-
-- **入口处（文字 $\to$ 整数行号 $\to 1 \times 576$ 向量）**：输入 `"Hello"` 时，先查 `tokenizer.json` 拿到整数行号 **`19556`**；紧接着拿 `19556` 当作行下标，去 `model.safetensors` 的 `[49152, 576]` 矩阵里把**第 `19556` 行**那 **$1 \times 576$** 个浮点数整行抽出来，送入 30 层网络做矩阵运算。
-- **出口处（$1 \times 576$ 向量 $\to 49,152$ 个候选得分 $\to$ 整数行号 $\to$ 文字）**：当 30 层网络对这串 $1 \times 576$ 向量加工完毕后，在最后一步会把它乘上 `[576, 49152]` 的转置矩阵，算出全部 `49,152` 个候选词各自的得分（Logits）；挑出得分最高的那个下标（比如第 `17` 列得分最高，即 Token ID 为 `17`），最后再去反查 `tokenizer.json`，把整数 `17` 还原成字符 `"!"`。
-
-#### （3）model.safetensors：参数张量仓库
-
-第三个核心文件 `model.safetensors`，是以 Hugging Face `SafeTensors` 二进制格式存储的模型全部 **272 个静态参数张量（Parameter Tensors）**。文件头部是一段记录每个张量名称、数据类型与形状偏移量的 JSON 索引头，紧接着便是按 64 字节对齐排列的原始浮点数内存块，支持操作系统直接通过 `mmap` 零拷贝映射进内存。
-
-看到“272 个张量”这个数字千万别被吓到——它们绝不是 272 个五花八门的复杂结构，而是按 **`1 + 30 × 9 + 1 = 272`** 的三明治结构整齐排列的：**最前面 1 个入口查表矩阵**，**最后面 1 个出口校准向量**，中间则是 **30 层完全复制粘贴的标准楼层（每层固定只有 9 个张量，$30 \times 9 = 270$）**。也就是说，整座模型真正不同的张量角色只有 $1 + 9 + 1 = 11$ 种，看懂一层楼，就看懂了整座模型。而且正如前置篇所讲，张量是向量与矩阵的统称——这也是为什么权重文件后缀叫 `.safetensors` 而不叫 `.safematrices`：在这 272 个权重里，有 **211 个是二维矩阵**，还有 **61 个是一维向量**（每层 2 个归一化向量、30 层共 60 个，外加最后 1 个形状为 `[576]` 的出口归一化向量）。
-
-围绕这个权重文件，我们也先厘清三个最关键的基础问题：
-
-**第一，这里的浮点数用的是什么标准？一个浮点数占几个字节？（`BF16` vs `FP32` / `FP16`）**
-
-日常写普通代码（如 Rust 的 `f32` 或 C 的 `float`）默认使用 IEEE 754 标准的 **32 位单精度浮点数（FP32）**，每个数占 **4 个字节（32 bits = 1 位符号 + 8 位指数 + 23 位尾数）**。但对动辄上百亿参数的大模型来说，4 字节太占显存；而传统的 16 位半精度浮点数（**FP16**，占 2 字节，1 位符号 + **5 位指数** + 10 位尾数）由于指数位只有 5 位（最大只能表示 $65504$），在矩阵连乘时极易发生数值溢出（`Inf`/`NaN`）。
-
-因此，包括本模型在内的现代主流大模型（见 `config.json` 中的 `"torch_dtype": "bfloat16"`），普遍采用 Google Brain 专为深度学习设计的 **BF16（Brain Floating Point 16，16 位脑浮点数）** 标准：每个浮点数只占 **2 个字节（16 bits）**，但它**完整保留了与 FP32 相同的 8 位指数位（1 位符号 + 8 位指数 + 7 位尾数）**。它用牺牲小数点后末尾几位尾数精度的微小代价，换来了与 32 位浮点数完全一致的抗溢出动态范围，同时让硬盘与显存体积直接减半。
-
-**第二，词表文件 vs 我们接触的第一张矩阵有多大？**
-
-我们可以现场算一笔账：
-
-- **词表文件 `tokenizer.json`（仅 `2.0 MB`）**：因为它只存了 `49,152` 个词元字符串、整数行号与合并规则文本，不存那 576 维浮点数，所以体积只有 **2.0 MB**。
-- **第一张矩阵 `model.embed_tokens.weight`（独占 `56.62 MB`）**：它的形状是 `[49152, 576]`，包含的浮点数总数为：
-
-$$
-49,152\text{ 行} \times 576\text{ 列} = 28,311,552\text{ 个浮点数（约 2,831 万个参数）}
-$$
-
-按每个 `BF16` 浮点数占 **2 个字节**计算，这张表在硬盘上的物理体积为：
-
-$$
-28,311,552 \times 2\text{ Bytes} = 56,623,104\text{ Bytes} \approx \mathbf{56.62\text{ MB}}
-$$
-
-要知道，整座模型 272 个张量合在一起总共才 `269.03 MB`（`134,515,008` 个参数）——光是我们刚认识的这**第一张矩阵 `model.embed_tokens.weight`**，就吃掉了 **`56.62 MB`**，占去全模型总体积的 **$21.05\%$（超过五分之一）**！（注：如果你以后去下载 70B 或 DeepSeek 等超大模型，会看到 `.safetensors` 被切分为多个 `model-00001-of-00010.safetensors` 分片文件并附带一份 `model.safetensors.index.json` 目录表，那正是因为上百亿个 `BF16` 浮点数算下来达上百 GB，单个文件装不下而做的物理分片。）
-
-**第三，深度拆解第一张矩阵：`model.embed_tokens.weight` 叫什么矩阵？里面的参数是怎么决定的？训练中会修改吗？这些参数到底意味着什么？**
-
-既然这张矩阵占了全模型超过五分之一的分量，又是整个前向计算的第一站，我们把它的来龙去脉一次性讲透：
-
-1. **它叫什么矩阵？为什么起这个名字？**
-   在深度学习与自然语言处理中，这张矩阵的标准学术名称叫**词嵌入矩阵（Token Embedding Matrix，数学公式中通常记作 $\mathbf{W}_E \in \mathbb{R}^{V \times d}$）**。
-   拆解它在权重文件中的键名 `model.embed_tokens.weight`：`model` 代表主干网络；`embed_tokens` 意为“将词元嵌入（Embed）到高维空间”——即把原本孤立、离散的整数词号（Token ID）映射为连续几何空间（$\mathbb{R}^{576}$）中的一个向量坐标；末尾的 `.weight` 则表明它是神经元连接上的**可学习权重参数**。
-   此外，在 `SmolLM2-135M` 中（见 `config.json` 的 `"tie_word_embeddings": true`），这张矩阵还身兼二职：在阶段 02 入口处，它是按行查表的**词嵌入矩阵**；到了阶段 09 出口处，它又转置过来充当把 576 维向量还原为 49,152 个候选词得分的**语言模型输出头矩阵（LM Head）**。
-
-2. **里面的 2,831 万个浮点数参数是怎么决定的？**
-   这 `49,152 × 576` 个数字**绝不是**程序员手工填写的，也不是靠某种人为编写的语法规则算出来的，而是**从随机噪声出发，在海量语料预训练中由数据自动雕刻出来的**。
-   在模型刚创建、尚未开始训练的第 0 步（**随机初始化阶段**），程序只是读取 `config.json` 中的 `"initializer_range": 0.0416666...`（数值上等于 $1/\sqrt{d} = 1/\sqrt{576} \approx 0.04167$），用均值为 $0$、标准差为 $0.04167$ 的正态分布随机数生成器，填满了整张 `[49152, 576]` 矩阵。在这一刻，`"Hello"` 对应的第 `19556` 行和 `"Rust"` 对应的第 `36828` 行，全都是毫无意义的随机白噪声。
-
-3. **训练过程中会修改吗？是怎么修改的？推理时还会变吗？**
-   - **在训练（预训练与微调）过程中：不仅会修改，而且每训练一步都在被反向传播持续修改。**
-     训练时，研发团队把数万亿词的文本语料喂给模型，让模型不断做“根据上文预测下一个词”的填空练习。例如输入上文 `"I love writing code in"`，真实标准答案是下一个词 `" Rust"`（行号 `36828`）。模型先从 `model.embed_tokens.weight` 查出上文各词的 576 维向量，穿过 30 层网络算出词表所有词的预测概率。
-     起初因为参数是随机的，模型猜中 `" Rust"` 的概率极低，由此算出一个预测误差（**交叉熵损失 Cross-Entropy Loss**）。紧接着，训练框架启动**反向传播（Backpropagation）**：利用微积分链式法则，从第 30 层出口一路倒推回第 0 层入口，精确算出 `model.embed_tokens.weight` 里被查到的那几行、每一个浮点数对这次猜错负有多大责任（即**梯度 Gradient**，$\frac{\partial \mathcal{L}}{\partial \mathbf{W}_E}$）。随后，**优化器（Optimizer，如 AdamW）**顺着减小误差的负梯度方向，直接修改矩阵里这些浮点数的数值。经过成百上千亿次“预测 $\to$ 算误差 $\to$ 反向求导 $\to$ 微调参数”的迭代，这张矩阵才最终收敛定型。
-     （注：关于损失函数、反向传播求导与优化器更新的完整数学细节，此处我们仅作简要勾勒以建立全局直觉，后续专门章节会做深入拆解；在本篇中，你只需知道这些参数是由训练过程雕刻出来的即可。）
-   - **在训练结束后的推理阶段（即我们今天下载运行的阶段）：永久冻结、只读不改。**
-     一旦训练完成并导出为 `model.safetensors`，`model.embed_tokens.weight` 里的 2,831 万个浮点数就作为**静态权重（Static Weights）永久冻结**了。今天我们在本地跑推理时，模型只是从这张表里**只读拷贝**出对应的行作为第 0 层初始激活；后续 30 层网络根据上下文实时修改的，是内存里临时开辟的**中间激活（Activations）**，绝不会回头改动 `model.embed_tokens.weight` 里的任何一位数字。
-
-4. **这些参数到底意味着什么？（高维语义空间的几何坐标）**
-   训练完成后，`model.embed_tokens.weight` 的每一行（576 个浮点数）就代表对应词元在 **576 维连续语义空间中的初始特征坐标**。
-   为什么梯度下降能让一串浮点数拥有“语义”？因为在训练过程中，凡是经常出现在相似上下文语境里的词（比如 `"Rust"`、`"C++"` 与 `"Python"` 后面常接 `"compiler"` 或 `"code"`），为了都能准确预测出相同的下文，反向传播传回来的梯度会逼着它们各自那 576 个数字向同一个方向靠拢。
-   最终，这 576 个浮点数共同编码了该词元的**分布式特征（Distributed Features）**——包括它的词性（名词、动词、介词）、语义范畴（编程语言、动物、情感）、单复数与时态倾向等。虽然单个坐标轴下标（例如第 `19556` 行第 `0` 列的 `-0.0498`）本身并没有固定的人类可读标签，但整条 576 维向量在空间中的**方向与夹角（余弦相似度）**却精确反映了词与词之间的语义远近，为后续 30 层 Transformer 的矩阵运算提供了全部原始素材。
-
-#### （4）其他配套文件
-
-除了上面三个必下文件，你在 Hugging Face 仓库页面还会看到以下几类外围配套文件。细心的读者一定会问：像特殊词元配置、对话模板和生成采样配置，听起来都很重要，为什么今天不用下载？我们把原因逐一讲清：
-
-- **`tokenizer_config.json` 与 `special_tokens_map.json`（特殊控制词元映射与对话模板配置）**：
-  **它们的作用是什么？** 自回归语言模型在数学本质上只会根据上文续写下一个词。为了让模型在多轮对话中准确区分系统指令（`system`）、用户输入（`user`）与模型回复（`assistant`），并知道何时停笔，词表中引入了不参与常规 BPE 切分的**特殊控制词元（Special Tokens，如起始符 `<|im_start|>` 与终止符 `<|im_end|>`）**。`special_tokens_map.json` 用于声明这些特殊词元的角色；而 `tokenizer_config.json` 则包含一段 Jinja2 格式的**对话渲染模板（`chat_template`）**，规定如何把多轮聊天数组自动拼接成 `<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n` 这样的单条字符串。
-  **为什么今天不用下载？** 一方面，全部 17 个特殊控制词元的 ID 与防切碎规则（`"special": true`）**已经 100% 内嵌在我们刚下载的 `tokenizer.json` 顶部的 `"added_tokens"` 数组里了**，Rust 分词引擎直接从 `tokenizer.json` 内部读取，根本不需要外挂 `special_tokens_map.json`；另一方面，为了在第 0 篇让你不隔着模板引擎、一眼看穿带控制符的原始输入文本，我们在 Rust 探针代码里直接把那行拼好的 `<|im_start|>...` 字符串明文写了出来。等到之后处理多轮对话输入时，我们再正式接入对话模板。
-
-- **`generation_config.json`（默认解码采样超参数配置）**：
-  **它的作用是什么？** 该文件完全不参与模型的前向矩阵乘法，只记录官方推荐的**解码采样策略（Decoding & Sampling Strategy）**默认值。当模型在阶段 09 算出词表 `49,152` 个候选词的得分（Logits）后，如果每次都死板地挑第 1 名，长文生成时容易陷入车轱辘话循环。因此实际聊天部署时会引入随机采样，核心参数包括 **`temperature`（温度系数，在 Softmax 归一化前用得分除以该系数：$T \to 0$ 时趋近于只选第 1 名的确定性解码，$T$ 越大概率分布越平缓、随机性越强）** 与 **`top_p`（Nucleus Sampling 核采样阈值，例如 `0.9` 表示将候选词按概率从高到低排序后，只保留累积概率达到 90% 的头部候选池，然后在池子里随机掷骰子抽词）**。
-  **为什么今天不用下载？** 因为一旦按 `generation_config.json` 开启随机掷骰子（`"do_sample": true`），你每跑一次程序，模型挑出的词都可能变一下（这次回 `"Hello"`，下次回 `"Hi"`）。而在第 0 篇中，我们的目标是做**百分之百可复现的白盒追踪**——确保无论你在 macOS、Windows 还是 Linux 上运行，算出的每一个浮点数和生成的每一个词都分毫不差。因此本篇我们在阶段 10 刻意使用完全确定性的**贪心解码（Greedy Decoding，直接挑得分最高的第 1 名）**；之后专门研究如何控制生成随机性时，我们再亲手实现这套采样器。
-
-- **`vocab.json` 与 `merges.txt`（旧版 Python 分词器的独立词表与合并规则表）**：
-  早期纯 Python 分词器不支持读取一体化的 `tokenizer.json`，需要将 **BPE（Byte-Pair Encoding，字节对编码）** 的字典映射（`vocab.json`）与子词合并优先级表（`merges.txt`）拆成两个文件存储。这两份文件的数据已 100% 包含在 `tokenizer.json` 中，仅作向后兼容保留。
-
-- **`README.md`、`LICENSE` 与 `onnx/` 目录**：
-  `README.md` 是记录训练数据与评测基准的**模型卡（Model Card）**；`LICENSE` 为开源协议声明（本模型采用 `Apache-2.0` 协议）；`onnx/` 目录则存放转换为 **ONNX** 开放中间格式的权重，供浏览器 WebGPU 或移动端引擎调用。
+> **为什么不用下载仓库里的其他文件？**
+> - `tokenizer_config.json` / `special_tokens_map.json`：特殊控制词元 ID 已内嵌于 `tokenizer.json` 中，本篇直接在代码中明文书写 ChatML 模板字符串以保持白盒透明；
+> - `generation_config.json`：记录随机采样的 `temperature` 与 `top_p` 参数；本篇采用 100% 确定性的**贪心解码（Greedy Decoding）**以确保跨平台数值完全可复现；
+> - `vocab.json` / `merges.txt`：旧版 Python 分词器的拆分文件，数据已完全包含在 `tokenizer.json` 内。
 
 ### 3. 克隆仓库并下载模型
-
-搞清楚了上面这些文件的来龙去脉，现在我们打开终端，先把本篇的配套代码仓库克隆到本地，然后把这三个核心模型文件下载到仓库的 `models/SmolLM2-135M-Instruct` 文件夹中（其中 `curl -L` 表示自动跟随云存储跳转链接，`-o` 表示保存到本地指定路径）。
 
 **macOS / Linux / WSL 终端：**
 
 ```bash
 git clone https://github.com/wittkung/llm.git
 cd llm
-
 mkdir -p models/SmolLM2-135M-Instruct
 
-# 国内网络可直接用 hf-mirror.com 满速下载（海外网络将 hf-mirror.com 换回 huggingface.co 即可）
 BASE_URL="https://hf-mirror.com/HuggingFaceTB/SmolLM2-135M-Instruct/resolve/main"
-
 curl -L "${BASE_URL}/config.json"       -o models/SmolLM2-135M-Instruct/config.json
 curl -L "${BASE_URL}/tokenizer.json"    -o models/SmolLM2-135M-Instruct/tokenizer.json
 curl -L "${BASE_URL}/model.safetensors" -o models/SmolLM2-135M-Instruct/model.safetensors
 ```
 
-**Windows PowerShell**（注意在 PowerShell 中需写 `curl.exe` 以调用系统原生下载工具）：
+**Windows PowerShell：**
 
 ```powershell
 git clone https://github.com/wittkung/llm.git
 cd llm
-
 New-Item -ItemType Directory -Force -Path models\SmolLM2-135M-Instruct | Out-Null
 
 $BASE_URL = "https://hf-mirror.com/HuggingFaceTB/SmolLM2-135M-Instruct/resolve/main"
-
 curl.exe -L "$BASE_URL/config.json"       -o models\SmolLM2-135M-Instruct\config.json
 curl.exe -L "$BASE_URL/tokenizer.json"    -o models\SmolLM2-135M-Instruct\tokenizer.json
 curl.exe -L "$BASE_URL/model.safetensors" -o models\SmolLM2-135M-Instruct\model.safetensors
@@ -309,40 +181,7 @@ curl.exe -L "$BASE_URL/model.safetensors" -o models\SmolLM2-135M-Instruct\model.
 
 ### 4. 运行 llm-tracer 开箱体检
 
-模型文件下好了，拿什么程序去读取和运行它？
-
-既然我们在开篇立下规矩“拒绝黑盒”，我们就不用任何封装好的第三方推理命令行，而是直接用本篇配套仓库里手写的白盒 Rust 探针程序——**`llm-tracer`**。
-
-在运行它之前，我们先花一分钟看清这个 Rust 项目的目录结构，以及它内部到底写了什么代码：
-
-```text
-llm/                                   # 配套仓库根目录
-├── Cargo.toml                         # 顶层工作区清单 (Workspace Cargo.toml：统一管理依赖版本、Lint 与编译优化)
-├── models/
-│   └── SmolLM2-135M-Instruct/         # 刚刚下载的三个模型文件存放处
-│       ├── config.json
-│       ├── tokenizer.json
-│       └── model.safetensors
-└── crates/
-    └── llm-tracer/                    # 本篇的白盒探针代码包 (Crate)
-        ├── Cargo.toml                 # 探针包的依赖声明文件（继承顶层工作区配置）
-        └── src/                       # 按生产级 Rust 规范与本文阅读进度拆分的源码模块：
-            ├── main.rs                #   [59 行]  二进制命令行入口：解析 --mode 参数并调用核心库
-            ├── lib.rs                 #   [62 行]  核心库导出根 (Library Root) + 自动化单元测试套件
-            ├── prelude.rs             #   [99 行]  对应前置篇 (--mode prelude)：5 条张量与线性代数法则演练沙盒
-            ├── inspect.rs             #   [139 行] 对应第二节 (--mode inspect)：读取配置并核验 272 个权重张量
-            ├── toy.rs                 #   [83 行]  对应第六节 (--mode toy)：用 3x4 玩具矩阵验证纸笔手算结果
-            ├── ops.rs                 #   [104 行] 对应第九节：trace 打印器 + 5 个核心数学算子
-            └── model.rs               #   [249 行] 对应第九、十节 (--mode real)：11 阶段完整前向推理与 KV Cache 循环
-```
-
-为了让第一次接触 Rust 的读者既能轻松读懂全部源码，又能从第一天起接触工业级 Rust 项目的标准写法，我们的代码组织遵循了四项生产级工程规范，并按本文的阅读顺序把 `crates/llm-tracer/src/` 拆成了职责单一的小模块（每个文件只有 59 到 249 行）：
-
-- **规范 1：薄二进制入口 + 核心库分离（`main.rs` + `lib.rs`）**：在生产级 Rust 项目中，`src/main.rs` 只负责解析命令行参数，绝不堆放业务逻辑；真正的算法模块全部由 `src/lib.rs` 导出。这样既能在 `lib.rs` 中直接运行 `cargo test` 自动化单元测试，也允许后续篇章的代码包直接复用本篇写好的算子。
-- **规范 2：工作区依赖与安全门禁集中管理（Workspace Lints & Dependencies）**：顶层 `Cargo.toml` 统一锁定依赖版本，开启 `unsafe_code = "forbid"`（全库禁止不安全裸指针）与 `clippy` 静态检查，并配置 `[profile.dev.package."*"] opt-level = 3`（让底层矩阵库在开发调试模式下也开启最高级别 `-O3` 编译优化，兼顾秒级编译与真机推理速度）。
-- **规范 3：零运行期下标崩溃（No Index Panic）**：从 `.safetensors` 字典取权重时，不使用一旦拼错键名就会直接崩溃的 `&weights["..."]` 下标访问，而是统一封装返回 `Result` 的 `get_tensor(&weights, name)?`，用 `?` 运算符优雅传递上下文错误。
-
-各源码模块与本文章节的对应关系如下表所示：
+配套仓库中的 `crates/llm-tracer` 是专为本篇编写的白盒探针包，各源码模块的职责划分如下：
 
 | 源码文件 | 行数 | 对应章节 | 运行命令 | 核心职责 |
 |---|---|---|---|---|
@@ -353,61 +192,10 @@ llm/                                   # 配套仓库根目录
 | `src/ops.rs` | 104 | 第九节 | （由 `model.rs` 调用） | `trace` 打印器与 5 个核心数学算子 |
 | `src/model.rs` | 249 | 第九、十节 | `cargo run -- --mode real` | 11 阶段真机前向推理与 KV Cache |
 
-现在我们先打开前两个文件：`crates/llm-tracer/src/main.rs`（共 59 行）与 `crates/llm-tracer/src/inspect.rs`（共 139 行）。`main.rs` 从核心库 `use llm_tracer::{inspect, model, prelude, toy};` 引入模块，定义 `Mode` 枚举并在 `main()` 函数里按模式分发：
+`src/inspect.rs` 负责反序列化 `config.json`，并将 `model.safetensors` 中的 272 个 `BF16` 张量转换为 CPU 原生支持的 32 位单精度浮点数 `F32`：
 
 ```rust
-// crates/llm-tracer/src/main.rs（核心入口）
-use llm_tracer::{inspect, model, toy};
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum Mode {
-    Inspect, // 模式 1（第二节）：核验 272 个权重张量与参数账本
-    Toy,     // 模式 2（第六节）：核验 3x4 玩具矩阵手算结果
-    Real,    // 模式 3（第九、十节）：跑通 SmolLM2-135M 真机 11 阶段推理
-}
-
-fn main() -> Result<()> {
-    let args = Args::parse();
-    let dev = Device::Cpu;
-    let model_dir = resolve_model_dir(args.model_dir.as_deref());
-    match args.mode {
-        Mode::Inspect => inspect::run_inspect(&model_dir, &dev)?,
-        Mode::Toy     => toy::run_toy_verification(&dev)?,
-        Mode::Real    => model::run_real_trace(&model_dir, &dev)?,
-    }
-    Ok(())
-}
-```
-
-接着打开 `crates/llm-tracer/src/inspect.rs`（共 139 行）。这个文件专门负责我们即将运行的 `--mode inspect`，里面一共只干了三件事：
-
-```rust
-// crates/llm-tracer/src/inspect.rs（核心逻辑拆解）
-
-// 第 1 件事：定义与 config.json 字段一一对应的 Rust 结构体
-#[derive(Debug, Clone, Deserialize)]
-pub struct LlamaConfig {
-    pub model_type: String,
-    pub vocab_size: usize,              // V = 49,152
-    pub hidden_size: usize,             // d = 576
-    pub intermediate_size: usize,       // d_ff = 1,536
-    pub num_hidden_layers: usize,       // L = 30
-    pub num_attention_heads: usize,     // h_q = 9
-    pub num_key_value_heads: usize,     // h_kv = 3
-    pub max_position_embeddings: usize, // T_max = 8,192
-    pub rms_norm_eps: f64,              // eps = 1e-5
-    pub rope_theta: f32,                // theta = 100,000.0
-    pub tie_word_embeddings: bool,      // true（首尾共享词嵌入矩阵）
-}
-
-impl LlamaConfig {
-    // 自动计算单个注意力头的宽度：d_h = d / h_q = 576 / 9 = 64
-    pub fn head_dim(&self) -> usize {
-        self.hidden_size / self.num_attention_heads
-    }
-}
-
-// 第 2 件事：读取 config.json，并把 model.safetensors 里的 272 个 BF16 张量加载为 F32
+// crates/llm-tracer/src/inspect.rs（核心逻辑）
 pub fn load_config_and_weights(
     model_dir: &Path,
     dev: &Device,
@@ -415,39 +203,22 @@ pub fn load_config_and_weights(
     let cfg_str = std::fs::read_to_string(model_dir.join("config.json"))?;
     let cfg: LlamaConfig = serde_json::from_str(&cfg_str)?;
 
-    // 加载 .safetensors 文件，得到 "张量名字 -> Tensor" 的哈希表
     let raw = candle_core::safetensors::load(model_dir.join("model.safetensors"), dev)?;
     let mut f32_map = HashMap::with_capacity(raw.len());
     for (k, v) in raw {
-        f32_map.insert(k, v.to_dtype(DType::F32)?); // 转为 32 位浮点数供 CPU 计算
+        f32_map.insert(k, v.to_dtype(DType::F32)?);
     }
     Ok((cfg, f32_map))
 }
-
-/// 安全按名读取权重张量（避免使用 &weights[key] 在键名缺失时直接崩溃）
-pub fn get_tensor<'a>(weights: &'a HashMap<String, Tensor>, key: &str) -> Result<&'a Tensor> {
-    weights
-        .get(key)
-        .with_context(|| format!("Missing required weight tensor '{key}' in model.safetensors"))
-}
-
-// 第 3 件事：在 run_inspect() 中打印 Part 1、Part 2（第 0 层的 9 个张量）与 Part 3，并汇总参数量
-let w_embed = get_tensor(&weights, "model.embed_tokens.weight")?;
-println!("shape: {:?} | {} params", w_embed.dims(), w_embed.elem_count());
-
-let total_params: usize = weights.values().map(|t| t.elem_count()).sum();
-let bf16_bytes = total_params * 2; // 每个 BF16 参数在硬盘上占 2 个字节
 ```
 
-看懂了 `src/main.rs` 和 `src/inspect.rs` 的全部逻辑，现在我们在终端直接运行它：
+在终端运行 `--mode inspect`（注意中间的 `--` 用于将右侧参数传递给 `llm-tracer`）：
 
 ```bash
 cargo run -- --mode inspect
 ```
 
-（命令中间那个单独的双横线 `--` 是 `cargo` 的语法约定：双横线左边是给构建工具 `cargo run` 看的，双横线右边的 `--mode inspect` 则是传给我们自己写的 `llm-tracer` 程序的参数。程序会自动定位仓库下的 `models/SmolLM2-135M-Instruct` 目录，你也可以显式加上 `--model-dir models/SmolLM2-135M-Instruct`。）
-
-首次运行时，`cargo` 会自动下载并编译所需的依赖库；编译完成后不到一秒钟，终端上就会打印出从 `config.json` 解析出的架构参数，以及 `model.safetensors` 内部 272 个张量的核验报告：
+终端随即输出完整的模型权重解剖报告：
 
 ```text
 === [1/2] Blueprint Parsed from config.json ===
@@ -475,103 +246,52 @@ Loaded 272 parameter tensors in F32.
 Total Tensors: 272 | Total Parameters: 134515008 (~134.52M) | BF16 Disk Footprint: 269.03 MB
 ```
 
-别急着划走，我们逐行拆解屏幕上这份体检报告——它把一座大语言模型的全部家底交代得清清楚楚：
+### 5. 权重结构拆解：1 + 30 × 9 + 1 = 272
 
-#### 1. 架构常数与权重加载
-
-前四行打印的是程序从 `config.json` 读取的核心尺寸常数（词表大小 $V=49152$、隐藏层宽度 $d=576$、层数 $L=30$、查询头数 $h_q=9$、键值头数 $h_{kv}=3$、MLP 宽度 $d_{ff}=1536$），外加程序自动算出的单头宽度 `head_dim (d_h): 64`（由 $d / h_q = 576 / 9 = 64$ 得出）。
-
-紧接着第 6 行打印了 `Loaded 272 parameter tensors in F32`。细心的读者可能会问：**前面不是刚说过硬盘里的 `model.safetensors` 存的是 2 字节的 `BF16` 浮点数吗，怎么加载进内存变成了 `F32`（4 字节标准单精度浮点数）？**
-
-因为普通笔记本电脑的 CPU 原生浮点运算器对 32 位 `F32` 支持最完整、累加精度最高。因此，我们的 `llm-tracer` 在把硬盘上 269 MB 的 `BF16` 权重读入内存时，顺手将这 272 个张量统一转换成了 4 字节的 `F32` 格式（在内存中约占 $538\text{ MB}$），以便后续直接做高精度的 CPU 矩阵乘法。
-
-#### 2. 权重结构拆解（1 + 30 × 9 + 1）
-
-初学者第一次看到 `Total Tensors: 272` 时，很容易心里一紧：难道我要认识 272 个完全不同的矩阵吗？
-
-**完全不需要。** 仔细看下半部分的输出标题：`1 + 30 * 9 + 1 = 272 Tensors`。整座模型在结构上就像一栋标准写字楼，只有**“一头（1 个）、一尾（1 个）、外加中间 30 层一模一样的标准楼层（每层 9 个）”**——真正需要你认识的独立张量角色，加起来只有 **$1 + 9 + 1 = 11$ 个**！
-
-输出的每一行都按 **`张量名称`** $\mid$ **`形状 (shape)`** $\mid$ **`参数量 (params)`** 三列排版（其中 `params` 就是把 `shape` 方括号里的维度数字直接相乘）。我们把这“一头、中间 $30 \times 9$、一尾”逐个拆开来看它们各自干什么：
-
-##### （1）开头的 1：共享词嵌入表
-
-- **对应张量**：`model.embed_tokens.weight`（形状 `[49152, 576]`，共 $49,152 \times 576 = 28,311,552$ 个参数，约 **2831 万参数**，占全模型总参数的 **21.05%**）。
-- **它是干嘛的**：前面分词器切出来的是整数词号（比如 `"Hello"` 是 `19556`），但后面的神经网络只能对连续的浮点数做矩阵乘法，没法直接拿整数编号做语义推理。所以进门第一步，必须拿词号来这第 1 张大表里按行查表，把每个整数词号翻译成一排 **576 维的浮点数特征向量**。
-- **一人兼两职**：因为配置里开启了 `tie_word_embeddings: true`（首尾权重共享），当数据走完 30 层楼到达顶层出口、需要把 576 维向量翻译回 49,152 个候选词的预测得分时，模型还会把这张表倒过来（转置成 $576 \times 49,152$）再用一次。
-
-##### （2）中间的 30 × 9：30 层 Transformer
-
-先回答第一个问题：**为什么要乘以 `30`（叠 30 层）？**
-
-刚从一楼查表出来的 576 维向量，还只是每个词“孤立的字面意思”，词与词之间还没有任何交流。模型把这串向量送进一栋 **30 层的标准流水线大楼**（`model.layers.0` 到 `model.layers.29`），一层接一层地往上做精加工：底部的几层先理清相邻词的语法搭配，中间的几层搞懂代词指代与长句结构，高层的几层提炼整段话的深层意图与下一步回答方向。
-
-最让人松一口气的是：**这 30 层楼的房间布局、张量名字后缀、矩阵形状尺寸 100% 复制粘贴！**（只是每层矩阵里训练出的具体浮点数数值不同）。因此体检报告只展开打印了第 `0` 层（`model.layers.0.*`）的 **9 个张量**——看懂这一层的 9 个张量，剩下的 29 层（261 个张量）你就自动全懂了。
-
-再回答第二个问题：**每一层里面的这 `9` 个张量又是干嘛的？**
-
-每一层标准楼层内部，只按顺序干**两件事**，对应两个串联的加工车间（**$5 + 4 = 9$ 个张量**）：
-
-1. **第一车间：左顾右盼找上下文（`self_attn` 自注意力子层，占 5 个张量）**
-   一个词孤立地看往往有歧义（比如“苹果”到底是水果还是手机？必须看前后的词）。第一车间的唯一任务，就是**让句子里的每一个词去和前文所有词对账、收集上下文信息**。它由 **5 个张量** 组成：
-   - **1 个进门校准向量**：`input_layernorm.weight`（形状 `[576]`，576 个参数）。注意它只有一个维度，是一维向量而非二维矩阵，负责在进入注意力计算前把向量的数值幅度稳住（RMSNorm 归一化）；
-   - **3 个提问与检索矩阵**：`self_attn.q_proj.weight`（形状 `[576, 576]`，$331,776$ 个参数）、`k_proj.weight`（形状 `[192, 576]`，$110,592$ 个参数）、`v_proj.weight`（形状 `[192, 576]`，$110,592$ 个参数）。它们分别把每个词的 576 维向量投影成三份角色：**“我要找什么线索（Query）”**、**“我身上有什么标签（Key）”**和**“我能提供什么内容（Value）”**。（为什么 `k_proj` 和 `v_proj` 的行数是 `192` 而不是 `576`？对照上半部分的图纸常数就能秒懂：查询头有 $h_q = 9$ 个，即 $9 \times 64 = 576$；而键值头采用了省显存的分组查询注意力 GQA，只有 $h_{kv} = 3$ 个，即 $3 \times 64 = 192$！图纸参数直接决定了矩阵尺寸）；
-   - **1 个汇总输出矩阵**：`self_attn.o_proj.weight`（形状 `[576, 576]`，$331,776$ 个参数），负责把 9 个注意力头收集回来的上下文信息重新融合成 576 维向量。
-
-2. **第二车间：独自消化与提取知识（`mlp` 前馈网络子层，占 4 个张量）**
-   在第一车间跟周围的词对完上下文之后，每个词回到自己的座位上**“独自消化思考”**，调用模型在预训练时记住的常识与特征关联。它由 **4 个张量** 组成：
-   - **1 个进门校准向量**：`post_attention_layernorm.weight`（形状 `[576]`，576 个参数），在进入第二车间前再做一次数值幅度校准；
-   - **3 个升维加工与降维矩阵**：`mlp.gate_proj.weight`（形状 `[1536, 576]`，门控开关矩阵）、`mlp.up_proj.weight`（形状 `[1536, 576]`，升维特征矩阵）与 `mlp.down_proj.weight`（形状 `[576, 1536]`，降维还原矩阵），每个矩阵各含 $1,536 \times 576 = 884,736$ 个参数。它们先把 576 维向量撑大到 **1536 维**（宽了近 3 倍）做门控非线性特征加工，再压缩回 **576 维**，交接给下一层楼。
-   - **一个值得注意的账面事实**：在同一层里，第一车间 4 个注意力矩阵加起来共 $884,736$ 个参数（约 88.5 万），而第二车间 3 个 MLP 矩阵加起来高达 $2,654,208$ 个参数（约 265.4 万）——**在每一层 Transformer 中，负责“独自消化知识”的 MLP 独占了约 75% 的参数量，是注意力机制的整整 3 倍。**
-
-把单层这 $5 + 4 = 9$ 个张量的参数加起来，就是 `Per-layer subtotal: 3540096 params`（每层约 **354 万参数**）；再乘以 30 层标准楼层，就是 $3,540,096 \times 30 = 106,202,880$ 个参数（约 **1.062 亿参数**，占全模型的 **78.95%**）。
-
-##### （3）末尾的 1：最终归一化向量
-
-- **对应张量**：`model.norm.weight`（形状 `[576]`，一维向量，仅含 **576 个参数**）。
-- **它是干嘛的**：当 576 维向量一路爬完 30 层楼（中间经历了 30 次注意力车间与 30 次 MLP 车间的累加），数值幅度难免会发生漂移。在把最终向量送去出口转化成词表得分之前，这最后 1 个向量负责做最后一次幅度标准化校准。
-
-#### 3. 272 个权重张量总表
-
-把上面三部分拼在一起，整座模型的 **272 个张量** 其实就是下面这张极简清单：
+272 个张量并非杂乱无章，而是严格按 **`1 + 30 × 9 + 1`** 的三段式结构排布（共 211 张二维矩阵 + 61 条一维归一化向量）：
 
 | 部位 | 张量数 | 核心权重与形状 | 参数量 | 占比 |
 |---|---|---|---|---|
 | **Part 1：共享词嵌入表** | $1$ | `embed_tokens.weight`: `[49152, 576]` | $28,311,552$ | $21.05\%$ |
-| **Part 2：30 层加工主楼** | $30 \times 9 = 270$ | 每层 5 个注意力张量 + 4 个 MLP 张量 | $106,202,880$ | $78.95\%$ |
+| **Part 2：30 层 Transformer** | $30 \times 9 = 270$ | 每层 5 个注意力张量 + 4 个 MLP 张量 | $106,202,880$ | $78.95\%$ |
 | **Part 3：最终归一化** | $1$ | `model.norm.weight`: `[576]` | $576$ | $0.0004\%$ |
 | **全模型总计** | **$272$** | **211 张二维矩阵 + 61 条一维向量** | **$134,515,008$** | **$100\%$** |
 
-看体检报告的最后一行汇总数据：
-- **总张量数（`Total Tensors`）**：$1 + 30 \times 9 + 1 = 272$ 个张量；
-- **总参数量（`Total Parameters`）**：$28,311,552 + 106,202,880 + 576 = 134,515,008$ 个浮点数（约 **1.345 亿**——这正是模型名称 `SmolLM2-135M` 中 **`135M`** 的精确来源，分毫不差）；
-- **磁盘占用（`BF16 Disk Footprint`）**：$134,515,008 \times 2\text{ Bytes} = 269,030,016\text{ Bytes} \approx 269.03\text{ MB}$，加上文件头十几 KB 的 JSON 目录，正好就是我们下载到本地的那个 `model.safetensors` 文件。
+30 层 Transformer（`model.layers.0` 至 `model.layers.29`）的内部结构与形状 100% 相同，每一层固定由 **9 个张量**（约 354 万参数）串联组成：
 
-现在，看着屏幕上这份体检报告，我们就彻底回答了开篇的第一个问题：**在计算机里，一个大语言模型究竟长什么样？**
+**（1）自注意力子层（`self_attn`，占 5 个张量，共 88.5 万参数）**
 
-许多初学者在拆开模型之前，常以为模型文件里装着某种复杂的“AI 思考代码”、成千上万条 `if-else` 逻辑规则，或者一座存满百科词条的压缩文本库。而这份白盒体检报告把真相摆在了台面上：
+负责跨序列位置检索并聚合上下文信息：
 
-**在计算机硬盘里，大语言模型既没有一行可执行逻辑代码，也没有存储任何一句现成的文本；它的本体，完完全全就是一本按“前 1 + 中间 30×9 + 后 1”整齐码放的 272 个命名浮点数数组（211 张二维矩阵 + 61 条一维向量）、共计 $134,515,008$ 个小数的数据字典。**
+- `input_layernorm.weight`（`[576]`）：注意力计算前的 Pre-RMSNorm 一维缩放向量；
+- `q_proj.weight`（`[576, 576]`）：将输入投影为 $h_q = 9$ 个查询头（$9 \times 64 = 576$）；
+- `k_proj.weight` 与 `v_proj.weight`（均为 `[192, 576]`）：将输入投影为 $h_{kv} = 3$ 个键值头（$3 \times 64 = 192$）；
+- `o_proj.weight`（`[576, 576]`）：将多头注意力输出重新融合回 576 维残差流。
+
+**（2）前馈网络子层（`mlp`，占 4 个张量，共 265.4 万参数）**
+
+负责单位置内部的非线性特征变换与知识提取（占单层参数量的 **75%**，是注意力层的 3 倍）：
+
+- `post_attention_layernorm.weight`（`[576]`）：进入 MLP 前的 Pre-RMSNorm 一维缩放向量；
+- `gate_proj.weight` 与 `up_proj.weight`（均为 `[1536, 576]`）：将 576 维向量双路升维至 $d_{ff} = 1536$ 维；
+- `down_proj.weight`（`[576, 1536]`）：将门控调制后的 1536 维特征投影回 576 维残差流。
+
+> **核心结论**：在计算机磁盘中，大语言模型既没有 `if-else` 逻辑规则，也没有压缩文本库；它的本体就是一个包含 **272 个命名浮点数数组（共计 1.345 亿个小数）** 的静态数据字典。
 
 ---
 
 ## 三、 参数矩阵与中间激活
 
-既然硬盘里的模型本体只是 **272 个静态的浮点数张量**，那当我们向模型输入一句话时，它是怎么“活”过来并开始推理的？
+当模型执行前向计算（Forward Pass）时，内存中的所有张量严格分为两类：
 
-答案是：当模型开始工作（执行前向计算 Forward Pass）时，计算机内存里流淌的所有张量会严格分成两个阵营：
+1. **参数矩阵（Parameter Matrices / Weights）**：从 `.safetensors` 加载，训练期定型，推理期全程**只读不变**。
+2. **中间激活（Intermediate Activations）**：随当前输入文本动态计算生成，推理结束后（除 KV Cache 外）立即释放。
 
-1. **参数矩阵（Parameter Matrices / Weights）**：它们在训练阶段由梯度下降雕塑成形，推理时从 `.safetensors` 文件加载进内存，全程**只读、不更新**。如词嵌入表、注意力投影矩阵、多层感知机（MLP）权重。
-2. **中间激活（Intermediate Activations）**：它们在模型等待输入时并不存在，只有当你的具体文本喂入模型后，才顺着计算图一层层动态算出来；一旦本次生成结束（除 KV 缓存外），它们就会被立刻丢弃。如隐藏状态、查询/键/值张量（$\mathbf{Q}/\mathbf{K}/\mathbf{V}$）、注意力权重、未归一化输出分数（Logits）。
+区分两者的唯一标准是**维度签名**。设批大小为 $B$、序列长度为 $T$、隐藏维度为 $d$、头数为 $h$、单头维度为 $d_h$、词表大小为 $V$：
 
-怎么在几十个张量里一眼认出谁是参数矩阵、谁是中间激活？只要看它们的维度签名。
+> **维度判定铁律**：所有**参数矩阵**的形状仅由架构常数 $(V, d, h, d_h, d_{ff})$ 决定，绝不包含 $B$ 和 $T$；所有**中间激活**的形状必定包含批大小 $B$ 与序列长度 $T$。
 
-设批大小为 $B$（Batch Size，同时处理的独立文本条数），当前输入序列的 Token 长度为 $T$（Sequence Length），模型的隐藏层特征宽度为 $d$（Hidden Size），注意力头数为 $h$（Number of Heads），单个注意力头的宽度为 $d_h$（Head Dimension，满足 $d = h \cdot d_h$），词表总大小为 $V$（Vocabulary Size）。这两类张量在维度签名上有一道极易辨认的分水岭：
-
-**所有参数矩阵的形状只由模型自身的架构常数（$V, d, h, d_h$）决定，绝不包含 $B$ 和 $T$；而所有中间激活的形状，必定处处带着批大小 $B$ 和序列长度 $T$。**
-
-也就是说，无论你这次输入的是 3 个词还是 3000 个词，从硬盘加载进来的 272 个参数矩阵形状永远固定不变；只有中间激活会随着本次输入的句子条数 $B$ 和词数 $T$ 动态变化。
-
-带着这条判断铁律，我们先看一眼整趟前向计算的 11 阶段全景表：
+整趟前向计算的 **11 阶段张量流转全景** 如下表所示：
 
 | 阶段 | 形状变化 | 静态参数矩阵 | 动态中间激活 |
 |---|---|---|---|
@@ -587,126 +307,70 @@ Total Tensors: 272 | Total Parameters: 134515008 (~134.52M) | BF16 Disk Footprin
 | **10. 选出下一个 Token** | $[B, T, V] \to [B, V] \to [B, 1]$ | 无参数矩阵 | $\text{logits}_{\text{last}}: [B, V]$ |
 | **11. 自回归生成循环** | 追加新词，步进循环 | 全模型权重复用 | 新增激活与 **KV Cache** |
 
-清楚了参数矩阵和中间激活的区别，下面我们就顺着这张表，从第 01 阶段开始一步步往下走。
-
 ---
 
 ## 四、 前向计算入口（阶段 01 — 03）
 
-### 01. 输入与分词
+### 01. 输入与分词（Tokenization）
 
-当你在聊天框里敲下一句简单的 `"Hello"`，模型并不会直接收到这五个英文字母。在进入模型之前，客户端程序会先用一套约定的对话模板（Chat Template）把你的话包裹起来——在前后加上标记角色与轮次的控制符。
-
-以我们将要在后文追踪的开源模型 `SmolLM2-135M-Instruct` 为例，哪怕只保留最精简的用户轮次包装，`"Hello"` 也会被展开成这样一串带控制符与换行符（`\n`）的文本：
+用户输入 `"Hello"` 后，客户端会先按对话模板（ChatML）包裹控制符与换行符：
 
 ```text
 <|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n
 ```
 
-（若直接调用官方默认模板而不显式关闭系统提示词，模板甚至还会在最前方自动塞入一段 21 个词元的默认 System Prompt：`"<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n"`。）
-
-接着，这串文本被交给分词器（Tokenizer）。分词器手里拿着我们在前文打开过的那本 `tokenizer.json` 词典（收录了 $V = 49,152$ 个基本词元 Token，编号从 $0$ 到 $49,151$）。
-
-当我们用真机加载 `SmolLM2-135M-Instruct/tokenizer.json` 切分上面那串纯用户轮文本时，一个极具代表性的真实细节立刻浮现出来——它没有被切成 9 个词，而是被精确切成了 **10 个整数**（即 $T = 10$）：
+分词器查 `tokenizer.json` 将该字符串切分为 $T = 10$ 个整数 Token ID：
 
 | 位置下标 $t$ | $0$ | $1$ | $2$ | $3$ | $4$ | $5$ | $6$ | $7$ | $8$ | $9$ |
 |---|---|---|---|---|---|---|---|---|---|---|
-| **切分出的词元** | `<\|im_start\|>` | `user` | `\n` (`Ċ`) | `Hello` | `<\|im_end\|>` | `\n` (`Ċ`) | `<\|im_start\|>` | `ass` | `istant` | `\n` (`Ċ`) |
+| **切分词元** | `<\|im_start\|>` | `user` | `\n` (`Ċ`) | `Hello` | `<\|im_end\|>` | `\n` (`Ċ`) | `<\|im_start\|>` | `ass` | `istant` | `\n` (`Ċ`) |
 | **Token ID** | `1` | `4093` | `198` | `19556` | `2` | `198` | `1` | `520` | `9531` | `198` |
 
-为什么 `"user"` 是一个整词（`4093`），而同样常见的 `"assistant"` 却被劈成了 `"ass"`（`520`）和 `"istant"`（`9531`）两半？
+> **为什么 `"assistant"` 被切成了 `"ass"`（520）+ `"istant"`（9531）？**
+> 英文正文中该词前面通常带空格（`"Ġassistant"` 在词表中是独立的 `11191` 号整词），而模板中 `<|im_start|>assistant` 紧挨特殊控制符无空格，分词器便按 BPE 规则将其拆分为两个已知词根。
 
-这正是真实 BPE 词表最有趣的地方：在日常英文正文里，`assistant` 几乎总是出现在句中、前面带着一个空格（即 `"Ġassistant"`，在词表里是单独的 `11191` 号整词）；而在 ChatML 模板里，`<|im_start|>assistant` 紧挨着特殊标记、前面**没有空格**。词表里恰好没有收录不带空格的完整 `"assistant"`，于是分词器便按照我们在前文看到的 `merges` 拼词规则，把它拆成了两个已知的词根 `"ass"` + `"istant"`。
-
-为了在接下来的原理解析与手算演练中保持清爽，我们先用一个更短的 $B = 1, T = 3$ 序列作为教学标本：假设输入三个词 `["我", "喜欢", "写"]`，对应的整数 ID 分别是 `1`、`3`、`4`。此时，原本的人类语言消失了，取而代之的是整个前向旅程的第一个动态张量：
+为便于后续手算演练，我们同时定义一个 $B=1, T=3$ 的极简序列 `["我", "喜欢", "写"]`（对应 ID `[1, 3, 4]`）：
 
 $$
 \text{input\_ids} = \begin{bmatrix} 1 & 3 & 4 \end{bmatrix}, \qquad \text{Shape: } [B, T] = [1, 3]
 $$
 
-至于分词器内部究竟是怎样通过字节对编码（BPE）把 UTF-8 字节流一步步合并成词元的，那是我们在《第 1 篇｜深入 Tokenizer》里要专门拆解的主题。在这里，你只需要记住：模型大门只认形状为 $[B, T]$ 的整数矩阵。
-
-**本阶段对应的 `config.json` 超参数：**
-
-- `"vocab_size": 49152`：规定词表总大小 $V = 49,152$，因此分词器输出的整数 Token ID 严格落在 `0..49151` 闭区间内；
-- `"bos_token_id": 1`（Beginning of Sequence）：序列起始控制词元 ID，对应上表第 0 位与第 6 位的 `<|im_start|>`（`1` 号）；
-- `"eos_token_id": 2` 与 `"pad_token_id": 2`（End of Sequence / Padding）：序列终止词元与批处理填充词元 ID，对应上表第 4 位的 `<|im_end|>`（`2` 号）。
-
-但这立刻带来了一个麻烦。整数编号 `1`、`3`、`4` 只是词典里的门牌号，没有代数意义——编号 `4`（“写”）并不等于编号 `1`（“我”）加上编号 `3`（“喜欢”），也没法直接放进矩阵乘法里求导和变换。模型怎样才能把一个冷冰冰的门牌号，变成一个能表达丰富特征的对象？
-
 ### 02. Embedding 查表
 
-这一步我们在前面拆解第一张权重矩阵 `model.embed_tokens.weight` 时已经接触过：模型给词表里的每一个 Token 都分配了一行长度为 $d$ 的浮点数向量，合起来就是形状为 $[V, d]$ 的**词嵌入矩阵（Token Embedding Matrix）** $\mathbf{W}_E$。
-
-当形状为 $[B, T]$ 的 `input_ids` 到达时，程序只需把每个整数 ID 当作行号，直接去 $\mathbf{W}_E$ 里把对应的那一行拷出来（注：在数学教材里，这一步常被写成“把整数 ID 变成只有对应位置为 1、其余位置全为 0 的 $V$ 维独热向量 One-Hot Vector，再乘以矩阵 $\mathbf{W}_E$”；但在实际代码里，没人会傻傻地做四万九千维的零乘法，直接按行号拷内存最快，结果完全等价）：
-
-- 拿走第 `1` 行，得到第 1 个词的 $d$ 维向量；
-- 拿走第 `3` 行，得到第 2 个词的 $d$ 维向量；
-- 拿走第 `4` 行，得到第 3 个词的 $d$ 维向量。
-
-把这 $T$ 个长度为 $d$ 的行向量按词语先后顺序上下叠在一起，原来的每一个整数就变成了一条 $d$ 维向量，张量形状完成了第一次变化：
+模型以 $[B, T]$ 中的每个整数 ID 为行下标，调用 `index_select` 从词嵌入矩阵 $\mathbf{W}_E \in \mathbb{R}^{V \times d}$ 中抽出对应的 $d$ 维行向量（数学上等价于 $V$ 维独热向量 One-Hot Vector 右乘 $\mathbf{W}_E$）：
 
 $$
 \text{input\_ids}: [B, T] \xrightarrow{\text{按行查表 } \mathbf{W}_E: [V, d]} \mathbf{H}^{(0)}: [B, T, d]
 $$
 
-这批查表得到的 $\mathbf{H}^{(0)}$ 就是第 0 层 Transformer 的初始**隐藏状态（Hidden States）**。在 Transformer 架构里，这个形状恒为 $[B, T, d]$ 的主干张量也被称为**残差流（Residual Stream）**——因为在接下来的 30 层网络里，它的外在形状 $[B, T, d]$ 始终不变，每一层算出来的新特征都是通过加法直接叠加到它上面的。
+查表所得的 $\mathbf{H}^{(0)}$ 即第 0 层初始**隐藏状态（Hidden States）**，也称为**残差流（Residual Stream）**——在后续 30 层网络中，主干张量始终保持 $[B, T, d]$ 形状，各层子模块的输出均通过逐元素加法叠加其上。
 
-**本阶段对应的 `config.json` 超参数：**
+### 03. 旋转位置编码（RoPE）
 
-- `"hidden_size": 576`：定义隐藏层（词嵌入向量）维度 $d = 576$，与 `"vocab_size": 49152` 共同决定了词嵌入矩阵 `model.embed_tokens.weight` 的形状 `[49152, 576]`；
-- `"torch_dtype": "bfloat16"`：指定权重张量采用 16 位脑浮点数（BF16，每参数占 2 字节）存储，因此全模型 $134,515,008\text{ 参数} \times 2\text{ 字节} = 269.03\text{ MB}$；
-- `"initializer_range": 0.0416666...`：数值上等于 $1 / \sqrt{d} = 1 / \sqrt{576} \approx 0.04167$，代表模型在预训练初始化阶段生成随机权重矩阵时所用的正态分布标准差。
+矩阵乘法本身对行顺序不敏感（调换输入词序只会调换输出行序）。为注入序列位置 $t \in \{0, \dots, T-1\}$，现代开源模型普遍采用**旋转位置编码（Rotary Position Embedding, RoPE）**：
 
-可是，如果我们只看 $\mathbf{H}^{(0)}$ 的形状 $[B, T, d]$，很快就会发现一个严重的漏洞。
-
-在接下来的网络层里，模型对这 $T$ 个词向量的加工全靠矩阵乘法。而矩阵乘法是逐行独立计算的：如果你把输入序列里的 `"猫 追 狗"` 调换成 `"狗 追 猫"`，查表得到的无非是把第 0 行和第 2 行对调了一下。如果不引入额外的位置信息，后面的矩阵算出来的结果也只是原封不动地对调第 0 行和第 2 行——模型根本分不清谁在前面、谁在后面。
-
-### 03. 位置编码（RoPE）
-
-为了让对顺序盲目的矩阵运算识别出词的先后次序，模型必须把每个词所处的下标位置 $t \in \{0, 1, \dots, T-1\}$ 编码进向量里。
-
-位置信息究竟在什么时候、用什么方式加进去？早期教科书模型和现代开源模型采用了两种不同的做法——这也是初学者看真实源码时最容易困惑的地方：
-
-1. **早期教科书方案（绝对位置编码，如初代 Transformer 与 GPT-2）**：直接在阶段 02 查表结束后动手。模型额外准备一张形状为 $[T_{\max}, d]$ 的位置参数表 $\mathbf{W}_{\text{pos}}$，取出前 $T$ 行得到 $[T, d]$，直接与刚查出来的词向量 $\mathbf{H}^{(0)}: [B, T, d]$ **逐元素相加**。
-2. **现代开源模型方案（旋转位置编码 RoPE，如 Llama、Qwen、SmolLM2）**：在阶段 02 查表结束后**什么都不加**，$\mathbf{H}^{(0)}$ 直接保持原样进入 Transformer 层；等到下一阶段（阶段 04）把隐藏状态拆分成注意力查询向量 $\mathbf{Q}$ 和键向量 $\mathbf{K}$（单头宽度 $d_h = 64$，形状为 $[B, h, T, 64]$）之后，再把每个 64 维向量划分为 **32 组二维子空间**（第 $i$ 维与第 $i+32$ 维构成二维向量 $[x_i, x_{i+32}]$，$i = 0 \dots 31$），并按几何级数分配 **32 组基准角频率** $\omega_i = 1 / 100000^{2i / 64}$。
-   对于序列位置下标为 $t$ 的词元，模型直接用我们在前置篇第三节学过的**二维正交旋转矩阵 $\mathbf{R}(t\omega_i)$** 将其第 $i$ 组二维子空间旋转 $t\omega_i$ 弧度（代码中预计算为形状 `[T_max, 32]` 的余弦 `cos` 与正弦 `sin` 查找表）。
-   **为什么正交旋转能编码相对位置？** 根据前置篇证明过的**相对旋转角点积保角性**，当位置 $m$ 的查询向量 $\mathbf{q}\mathbf{R}(m\omega_i)$ 与位置 $n$ 的键向量 $\mathbf{k}\mathbf{R}(n\omega_i)$ 在阶段 05 做内积时，旋转矩阵合并为 $\mathbf{R}(m\omega_i)\mathbf{R}(n\omega_i)^\top = \mathbf{R}\big((m - n)\omega_i\big)$——内积结果天然只依赖于两个词之间的**相对距离 $(m - n)$**，而与绝对位置无关！
-   （注：关于 RoPE 复数域推导与长上下文频率外推的完整细节，我们会在《第 2 篇｜深入 Transformer》里专门展开。）
-
-不管采用哪一种方案，有一条规律是不变的：**位置处理只修改张量里的数值，绝不改变张量的形状。**
-
-**本阶段对应的 `config.json` 超参数：**
-
-- `"max_position_embeddings": 8192`：定义最大上下文窗口长度 $T_{\max} = 8,192$（位置下标 $t \in [0, 8191]$）；
-- `"rope_theta": 100000`：定义旋转位置编码（RoPE）的基础底数 $\theta_{\text{base}} = 100,000$，用来计算不同维度的旋转步长；
-- `"rope_interleaved": false`：指定二维旋转分量的配对方式——`false` 代表采用 Llama 标准的半区配对（将单头 64 维向量的前 32 个数与后 32 个数一一配对旋转）；
-- `"rope_scaling": null`：表示在 `8,192` 原生长度内直接使用原始旋转角度，不做额外的长度缩放。
-
-现在，初始隐藏状态 $\mathbf{H}^{(0)}: [B, T, d]$ 已经准备完毕，正式进入第 0 层 Transformer 的第一个核心模块——多头自注意力层（Multi-Head Self-Attention）。
+1. **子空间配对**：在阶段 04 拆出单头维度 $d_h = 64$ 的查询向量 $\mathbf{Q}$ 与键向量 $\mathbf{K}$（形状 $[B, h, T, 64]$）后，将 64 个维度按半区配对为 **32 组二维向量** $[x_i, x_{i+32}]$（$i = 0 \dots 31$），并按几何级数分配基频 $\omega_i = 1 / 100000^{2i/64}$。
+2. **正交旋转**：对序列位置 $t$ 的词元，使用二维正交旋转矩阵 $\mathbf{R}(t\omega_i)$ 将第 $i$ 组二维子空间旋转 $t\omega_i$ 弧度。
+3. **相对位置点积不变性**：由前置篇证明的正交旋转性质，位置 $m$ 的查询向量与位置 $n$ 的键向量做点积时，旋转矩阵合并为 $\mathbf{R}(m\omega_i)\mathbf{R}(n\omega_i)^\top = \mathbf{R}\big((m-n)\omega_i\big)$，使注意力内积天然仅依赖于两词的**相对距离 $(m - n)$**。
 
 ---
 
 ## 五、 注意力机制（阶段 04 — 06）
 
-为什么我们需要注意力机制？
-
-在刚刚查表得到的 $\mathbf{H}^{(0)}: [B, T, d]$ 里，第 $t$ 行的向量只认识它自己对应的那个词。比如在句子 `"苹果发布了新款手机，它很轻"` 中，代表 `"它"` 的那一行向量只知道自己是个代词，却不知道自己指代的是前面的 `"苹果"` 还是 `"手机"`。注意力机制的唯一使命，就是让序列里的每一个位置都能回头审视前面的位置，把相关的上下文信息按权重吸收到自己身上来。
-
-为了看清这一过程在矩阵层面是怎么实现的，我们先用最经典的标准多头注意力（Multi-Head Attention, MHA）走通阶段 04 到 06 的每一次形状变化，随后立刻用纸笔手算一个完整的真实例子。
+在初始隐藏状态 $\mathbf{H}^{(0)}$ 中，每一行仅包含当前词自身的字面特征。**多头自注意力（Multi-Head Self-Attention）** 的作用是让每个位置根据特征匹配度，动态检索并加权融合前文所有位置的信息。
 
 ```mermaid
 flowchart TD
     H_in["输入隐藏状态 H_in (动态激活)<br/>Shape: [B, T, d]"]
 
     subgraph Stage04["阶段 04：注意力线性投影与拆头 (满足 d = h × d_h)"]
-        WQ["参数矩阵 W_Q<br/>Shape: [d, d]"]
-        WK["参数矩阵 W_K<br/>Shape: [d, d]"]
-        WV["参数矩阵 W_V<br/>Shape: [d, d]"]
+        WQ["参数矩阵 W_Q: [d, d]"]
+        WK["参数矩阵 W_K: [d, d]"]
+        WV["参数矩阵 W_V: [d, d]"]
 
-        Q_proj["Q 初始投影 (激活): [B, T, d]<br/>Reshape [B, T, h, d_h] + Transpose(1,2)<br/>→ Q: [B, h, T, d_h]"]
-        K_proj["K 初始投影 (激活): [B, T, d]<br/>Reshape [B, T, h, d_h] + Transpose(1,2)<br/>→ K: [B, h, T, d_h]"]
-        V_proj["V 初始投影 (激活): [B, T, d]<br/>Reshape [B, T, h, d_h] + Transpose(1,2)<br/>→ V: [B, h, T, d_h]"]
+        Q_proj["Q: [B, h, T, d_h]"]
+        K_proj["K: [B, h, T, d_h]"]
+        V_proj["V: [B, h, T, d_h]"]
     end
 
     H_in --> WQ --> Q_proj
@@ -714,11 +378,11 @@ flowchart TD
     H_in --> WV --> V_proj
 
     subgraph Stage05["阶段 05：缩放点积注意力与因果掩码"]
-        KT["K 转置最后两维 K^T<br/>Shape: [B, h, d_h, T]"]
-        Scores["注意力原始分数 S = QK^T / √d_h (激活)<br/>[B, h, T, d_h] × [B, h, d_h, T] → [B, h, T, T]"]
-        Mask["施加因果掩码 (Causal Mask)<br/>将上三角 j > i (未来位置) 置为 -∞"]
-        Probs["注意力权重 A = Softmax(S_masked) (激活)<br/>Shape: [B, h, T, T] (每一行概率和为 1)"]
-        OutH["各头上下文聚合 O_h = A @ V (激活)<br/>[B, h, T, T] × [B, h, T, d_h] → [B, h, T, d_h]"]
+        KT["K 转置最后两维 K^T: [B, h, d_h, T]"]
+        Scores["注意力分数 S = QK^T / √d_h: [B, h, T, T]"]
+        Mask["施加因果掩码 (上三角 j > i 置为 -∞)"]
+        Probs["注意力权重 A = Softmax(S_masked): [B, h, T, T]"]
+        OutH["上下文聚合 O_h = A @ V: [B, h, T, d_h]"]
     end
 
     Q_proj --> Scores
@@ -728,114 +392,71 @@ flowchart TD
     V_proj --> OutH
 
     subgraph Stage06["阶段 06：多头合并与输出投影"]
-        Concat["Transpose(1,2) 回 [B, T, h, d_h]<br/>+ Contiguous & Reshape 合并多头 (激活)<br/>→ O_concat: [B, T, d]"]
-        WO["参数矩阵 W_O<br/>Shape: [d, d]"]
-        DeltaH["注意力层输出 ΔH_attn (激活)<br/>Shape: [B, T, d] (随后加回残差流 H_in)"]
+        Concat["Transpose(1,2) + Reshape 合并多头<br/>→ O_concat: [B, T, d]"]
+        WO["参数矩阵 W_O: [d, d]"]
+        DeltaH["注意力层输出 ΔH_attn: [B, T, d]"]
     end
 
     OutH --> Concat --> WO --> DeltaH
 ```
 
-### 04. QKV 投影与拆头
+### 04. QKV 线性投影与拆头
 
-如果直接拿输入隐藏状态 $\mathbf{H}$ 和它自己的转置做点积（$\mathbf{H}\mathbf{H}^\top$），每个词和自己长得最像，算出来的注意力就会变成枯燥的“自己看自己”。要实现“代词去找名词”、“动词去找宾语”这样不对称的检索，模型必须先把同一个隐藏状态投影成三种不同的角色：
+为实现非对称的上下文检索，模型先用三张参数矩阵 $\mathbf{W}_Q, \mathbf{W}_K, \mathbf{W}_V$ 将输入隐藏状态 $\mathbf{H}$ 投影为三份角色：
 
-- **查询（Query, $\mathbf{Q}$）**：当前位置发出的检索请求——“我正在寻找什么样的前文特征？”
-- **键（Key, $\mathbf{K}$）**：每个位置挂在门外的特征标签——“我这里有什么特征可供检索？”
-- **值（Value, $\mathbf{V}$）**：一旦配对成功，该位置实际交出来的货真价实的内容向量。
-
-承担这次分流任务的是三张参数矩阵：$\mathbf{W}_Q \in \mathbb{R}^{d \times d}$、$\mathbf{W}_K \in \mathbb{R}^{d \times d}$ 和 $\mathbf{W}_V \in \mathbb{R}^{d \times d}$。输入的激活张量 $\mathbf{H} \in \mathbb{R}^{[B, T, d]}$ 分别右乘这三张参数矩阵，得到三个同样是 $[B, T, d]$ 的中间激活：
+- **查询（Query, $\mathbf{Q}$）**：当前位置发出的检索特征向量；
+- **键（Key, $\mathbf{K}$）**：各位置供检索匹配的特征索引向量；
+- **值（Value, $\mathbf{V}$）**：配对成功后实际被提取搬运的内容向量。
 
 $$
-\mathbf{Q}_{\text{raw}} = \mathbf{H}\mathbf{W}_Q, \quad \mathbf{K}_{\text{raw}} = \mathbf{H}\mathbf{W}_K, \quad \mathbf{V}_{\text{raw}} = \mathbf{H}\mathbf{W}_V \qquad (\text{Shape 均为 } [B, T, d])
+\mathbf{Q}_{\text{raw}} = \mathbf{H}\mathbf{W}_Q^\top, \quad \mathbf{K}_{\text{raw}} = \mathbf{H}\mathbf{W}_K^\top, \quad \mathbf{V}_{\text{raw}} = \mathbf{H}\mathbf{W}_V^\top
 $$
 
-这里需要注意一个工程细节（数学公式与 `safetensors` 权重的转置关系）：在数学推导中，我们习惯把权重记作 `[输入维度, 输出维度]`，直接写 $\mathbf{H}\mathbf{W}_Q$；而在 PyTorch 与 Hugging Face 的 `safetensors` 文件里，线性层权重是按 `[输出维度, 输入维度]` 存储的，因此在底层代码里实际执行的是 $\mathbf{H}\mathbf{W}_Q^\top$。当输入输出维度都等于 $d$ 时形状看似相同，但一旦遇到后面 GQA 或 MLP 这种输入输出不等宽的层，看清这一转置方向至关重要。
+> **权重转置说明**：Hugging Face `.safetensors` 中的线性层权重統一按 `[输出维度, 输入维度]` 存储，因此代码中计算线性投影时均需右乘转置矩阵 $\mathbf{W}^\top$。
 
-紧接着是关键的一步：**拆分注意力头（Split Heads）**。
+**拆分注意力头（Split Heads）与分组查询注意力（GQA）：**
 
-一句话里往往同时存在多种语义关系——既有语法上的主谓搭配，又有指代上的代词回溯，还有语气上的前后呼应。如果把整个 $d$ 维向量捆在一起只算一组注意力权重，不同维度的语义关系就会在单次加权平均中相互淹没。
-
-于是模型把总宽度 $d$ 均匀劈成 $h$ 份（即 $h$ 个注意力头），每个头只分到 $d_h = d / h$ 维的子空间，各自独立计算一套注意力。
-
-注意，**“拆头”这一步没有任何参数矩阵参与**，直接用我们在前置篇学过的 `reshape` + `transpose(1, 2)` 把 $h$ 个头换到外层维度，使每个头都能独立并行计算 `[T, d_h] × [d_h, T] -> [T, T]` 的注意力矩阵：
+为了让不同子空间同时捕捉语法、指代等多种语义关系，模型将总宽度 $d$ 拆分为多个单头宽度 $d_h = 64$ 的子空间，并通过 `reshape` 与 `transpose(1, 2)` 将头维度换到序列维度之前：
 
 $$
-\mathbf{Q}, \mathbf{K}, \mathbf{V} : [B, T, d] \xrightarrow{\text{Reshape}} [B, T, h, d_h] \xrightarrow{\text{Transpose}(1,2)} [B, h, T, d_h]
+[B, T, h \cdot d_h] \xrightarrow{\text{Reshape}} [B, T, h, d_h] \xrightarrow{\text{Transpose}(1,2)} [B, h, T, d_h]
 $$
 
-（在现代 Llama / Qwen / SmolLM2 模型中，此时还会紧接着对形状为 $[B, h, T, d_h]$ 的 $\mathbf{Q}$ 和 $\mathbf{K}$ 施加 RoPE 旋转位置编码，旋转后形状依然是 $[B, h, T, d_h]$。）
+在 `SmolLM2-135M` 中，查询头有 $h_q = 9$ 个（$\mathbf{Q}$ 形状为 `[B, 9, T, 64]`），而键值头采用**分组查询注意力（Grouped-Query Attention, GQA）**，仅有 $h_{kv} = 3$ 个（$\mathbf{K}, \mathbf{V}$ 形状为 `[B, 3, T, 64]`）。在计算点积前，代码通过 `repeat_kv` 将 3 个键值头各复制 3 份广播为 `[B, 9, T, 64]`，使每 3 个查询头共享 1 组键值头，从而将 KV 缓存显存占用降低三分之二。
 
-### 05. 注意力计算与因果掩码
+### 05. 缩放点积注意力与因果掩码
 
-现在，每个注意力头手里都有了一份形状为 $[T, d_h]$ 的查询表 $\mathbf{Q}$、键表 $\mathbf{K}$ 和值表 $\mathbf{V}$（外层套着 $[B, h]$）。
-
-第 $i$ 个位置的查询向量（长 $d_h$）怎样评估第 $j$ 个位置的键向量（长 $d_h$）跟自己有多匹配？最直接的线性代数工具就是**向量点积（Dot Product）**——两个向量方向越接近，点积算出来的分数就越高。把 $\mathbf{K}$ 的最后两个维度转置成 $\mathbf{K}^\top: [B, h, d_h, T]$，然后让 $\mathbf{Q}$ 与 $\mathbf{K}^\top$ 相乘，中间的维度 $d_h$ 在点积求和中消掉了，生成了一个关键的方阵维度 $T \times T$：
+每个注意力头将 $\mathbf{Q}$ 与转置后的 $\mathbf{K}^\top: [B, h, d_h, T]$ 相乘，消去内侧维度 $d_h$，并除以缩放因子 $\sqrt{d_h}$ 以稳定方差：
 
 $$
-\mathbf{Q}\mathbf{K}^\top : [B, h, T, d_h] \times [B, h, d_h, T] \longrightarrow [B, h, T, T]
+\mathbf{S} = \frac{\mathbf{Q}\mathbf{K}^\top}{\sqrt{d_h}}, \qquad \text{Shape: } [B, h, T, d_h] \times [B, h, d_h, T] \longrightarrow [B, h, T, T]
 $$
 
-为了防止 $d_h$ 较大时点积结果绝对值太大，我们将每个分数除以常数 $\sqrt{d_h}$（在 `SmolLM2` 中 $d_h = 64$，所以是除以 $\sqrt{64} = 8$）。
+自回归语言模型必须严格遵守**因果律（Causality）**：位置 $i$ 的词元只能看到 $j \le i$ 的历史与当前位置，绝不能偷看 $j > i$ 的未来位置。
 
-但就在这时，我们遇到了自回归语言模型最核心的一条规则：**因果性（Causality）——前面的词绝不能偷看后面的词。**
-
-在 $[T, T]$ 的分数方阵里，第 $i$ 行、第 $j$ 列的元素代表“第 $i$ 个词向第 $j$ 个词投去的关注度”。当 $j \le i$（对角线及左下角下三角区域）时，第 $i$ 个词是在看自己或自己前面的词，完全合法；但当 $j > i$（右上角上三角区域）时，第 0 个词已经在越界偷看第 1、第 2 个词了！如果不把这个漏洞堵死，模型在训练时就会直接偷看后面的标准答案。
-
-堵住漏洞的工具叫**因果掩码（Causal Mask）** $\text{mask}$。它是一个形状为 $[T, T]$ 的固定矩阵：下三角及对角线（$j \le i$）全为 $0$，右上角严格上三角（$j > i$）全为负无穷 $-\infty$。
-
-将掩码加到缩放后的分数矩阵上，接着对每一行做 **$\operatorname{softmax}$ 归一化**（正如前置篇所讲，右上角被掩码设为 $-\infty$ 的未来位置经 $e^{-\infty} = 0$ 后权重严格归零，其余合法位置的权重之和严格等于 $1$）：
+模型在分数方阵 $\mathbf{S}$ 上叠加一个上三角全为 $-\infty$、下三角及对角线全为 $0$ 的**因果掩码（Causal Mask）**，再按行执行 $\operatorname{softmax}$ 归一化（上三角经 $e^{-\infty} = 0$ 后权重严格归零），最后左乘值矩阵 $\mathbf{V}$：
 
 $$
-\mathbf{A} = \operatorname{softmax}\left(\frac{\mathbf{Q}\mathbf{K}^\top}{\sqrt{d_h}} + \text{mask}\right), \qquad \text{Shape: } [B, h, T, T]
+\mathbf{A} = \operatorname{softmax}\left(\frac{\mathbf{Q}\mathbf{K}^\top}{\sqrt{d_h}} + \text{mask}\right) \in \mathbb{R}^{[B, h, T, T]}, \qquad \mathbf{O}_h = \mathbf{A}\mathbf{V} \in \mathbb{R}^{[B, h, T, d_h]}
 $$
-
-拿到每行和为 $1$ 的注意力权重矩阵 $\mathbf{A}: [B, h, T, T]$ 后，用它左乘值矩阵 $\mathbf{V}: [B, h, T, d_h]$。这一次，中间的第二个 $T$ 与 $\mathbf{V}$ 的行维度 $T$ 在加权求和中消掉，尾部的 $d_h$ 重新浮现出来：
-
-$$
-\mathbf{O}_h = \mathbf{A}\mathbf{V} = \operatorname{softmax}\left(\frac{\mathbf{Q}\mathbf{K}^\top}{\sqrt{d_h}} + \text{mask}\right)\mathbf{V}, \qquad \text{Shape: } [B, h, T, d_h]
-$$
-
-经过 `[B, h, T, d_h] -> [B, h, T, T] -> [B, h, T, d_h]` 这一圈维度拆合，张量的外在形状回到了 $[B, h, T, d_h]$，但每个位置内部承载的向量已经完成了重组：刚才每个位置只有自身孤立的特征，现在每个位置的向量已经是它与前文所有合法位置 $\mathbf{V}$ 向量的加权融合。
 
 ### 06. 多头合并与输出投影
 
-现在，$h$ 个注意力头各自算出了自己的结果 $\mathbf{O}_h: [B, h, T, d_h]$。怎样把它们合回主干道所需的 $[B, T, d]$？
-
-只需把阶段 04 的拆头动作倒放一遍：
-
-1. 先把维度 1（$h$）和维度 2（$T$）换回来（`transpose(1, 2)`），形状变为 $[B, T, h, d_h]$；
-2. 在内存里整理成连续布局（`.contiguous()`），再把最后两维 $(h, d_h)$ 拍平合并回 $d = h \cdot d_h$，得到拼接后的激活 $\mathbf{O}_{\text{concat}}: [B, T, d]$。
-
-不过，单纯把 $h$ 个头的输出并排拼在一起，头与头之间依然是各自为政的（前 $d_h$ 列只来自第 1 个头，后 $d_h$ 列只来自第 2 个头）。为了让不同注意力头捕捉到的信息相互交换融合，模型在这里放下了本层的第四张参数矩阵——**输出投影矩阵** $\mathbf{W}_O \in \mathbb{R}^{d \times d}$：
+将 $h$ 个头的输出 $\mathbf{O}_h: [B, h, T, d_h]$ 经 `transpose(1, 2)`、`.contiguous()` 与 `reshape` 重新拼接为 $\mathbf{O}_{\text{concat}}: [B, T, d]$，再右乘输出投影矩阵 $\mathbf{W}_O^\top \in \mathbb{R}^{d \times d}$ 融合各头信息：
 
 $$
-\Delta\mathbf{H}_{\text{attn}} = \mathbf{O}_{\text{concat}} \mathbf{W}_O, \qquad \text{Shape: } [B, T, d] \times [d, d] \longrightarrow [B, T, d]
+\Delta\mathbf{H}_{\text{attn}} = \mathbf{O}_{\text{concat}} \mathbf{W}_O^\top, \qquad \text{Shape: } [B, T, d]
 $$
-
-算出的 $\Delta\mathbf{H}_{\text{attn}}: [B, T, d]$ 就是整个多头注意力子层最终交出的答卷。
-
-**本阶段对应的 `config.json` 超参数：**
-
-- `"num_attention_heads": 9`：查询头数 $h_q = 9$，由此导出单头子空间维度 $d_h = d / h_q = 576 / 9 = 64$；
-- `"num_key_value_heads": 3`：键值头数 $h_{kv} = 3$。该配置启用了**分组查询注意力（Grouped-Query Attention, GQA）**——即 $\mathbf{Q}$ 有 $9$ 个头，但 $\mathbf{K}$ 和 $\mathbf{V}$ 只有 $3$ 个头（每 $3$ 个查询头共享 $1$ 组键值头：查询头 `0,1,2` 共享第 `0` 组 $\mathbf{K}/\mathbf{V}$，查询头 `3,4,5` 共享第 `1` 组，查询头 `6,7,8` 共享第 `2` 组）。这直接决定了 `.safetensors` 中 `q_proj.weight` 的形状为 `[576, 576]`（$9 \times 64 = 576$），而 `k_proj.weight` 与 `v_proj.weight` 的形状只有 **`[192, 576]`**（$3 \times 64 = 192$）；在算注意力点积前，代码只需调用 `repeat_kv`（即我们在前置篇第五节学过的 `unsqueeze -> expand -> reshape` 三步曲）把 $3$ 个键值头各自原地复制 $3$ 份变成 $9$ 个头，就能与 $9$ 个查询头一一配对相乘；
-- `"attention_bias": false` 与 `"attention_dropout": 0.0`：指定 `q/k/v/o_proj` 四个线性层均不包含偏置向量 `.bias`，且注意力概率矩阵的 Dropout 丢弃率为 `0.0`。
 
 ---
 
 ## 六、 玩具维度手算示例
 
-公式和符号看再多遍，也不如亲手把每一个数字算出来一次踏实。
+为彻底验证阶段 04 — 06 的矩阵计算，我们设定一组可纸笔手算的极简维度：$B = 1$、序列长度 $T = 3$（输入 `["我", "喜欢", "写"]`）、隐藏维度 $d = 4$、头数 $h = 2$、单头维度 $d_h = 2$。
 
-现在我们把模型缩到最小，设定一套可以用心算验证的极简维度：
-- 批大小 $B = 1$（为了纸面排版清爽，下面写二维矩阵时代表 $B=1$ 下的那个唯一切片，同时注明带 $B$ 的完整形状）
-- 序列长度 $T = 3$，输入三个词：`["我", "喜欢", "写"]`，Token ID 为 `[1, 3, 4]`
-- 词表大小 $V = 6$
-- 隐藏维度 $d = 4$，注意力头数 $h = 2$，单头维度 $d_h = 2$（满足 $d = h \cdot d_h = 2 \times 2 = 4$）
+### 1. 输入隐藏状态与 QKV 投影
 
-### 第一步：输入隐藏状态
-
-假设经过 Embedding 查表（阶段 02）后，这三个 Token 抽出的 4 维向量组成的激活矩阵 $\mathbf{X}$（形状 $[1, 3, 4]$）如下：
+设阶段 02 查表所得的输入激活矩阵 $\mathbf{X} \in \mathbb{R}^{3 \times 4}$ 为：
 
 $$
 \mathbf{X}_{[3 \times 4]} = \begin{bmatrix}
@@ -850,9 +471,7 @@ $$
 \end{array}
 $$
 
-### 第二步：QKV 投影与拆头
-
-设模型训练好的三张静态参数矩阵 $\mathbf{W}_Q, \mathbf{W}_K, \mathbf{W}_V \in \mathbb{R}^{4 \times 4}$ 为（其中前 2 列对应第 1 个头 Head 1，后 2 列对应第 2 个头 Head 2）：
+给定三张 $4 \times 4$ 参数矩阵（前 2 列对应 Head 1，后 2 列对应 Head 2）：
 
 $$
 \mathbf{W}_Q = \begin{bmatrix}
@@ -875,79 +494,65 @@ $$
 \end{bmatrix}
 $$
 
-用 $\mathbf{X}$ 分别右乘这三张矩阵（因为 $\mathbf{X}$ 的元素非 $0$ 即 $1$，矩阵乘法直接简化为把权重矩阵的对应行相加。例如 $\mathbf{X}$ 的第 0 行是 $[1,0,1,0]$，乘出来的结果就是权重矩阵的第 0 行加第 2 行）：
+计算矩阵乘法 $\mathbf{X}\mathbf{W}_Q, \mathbf{X}\mathbf{W}_K, \mathbf{X}\mathbf{W}_V$：
 
 $$
-\mathbf{Q}_{\text{raw}} = \mathbf{X}\mathbf{W}_Q = \begin{bmatrix}
+\mathbf{Q}_{\text{raw}} = \begin{bmatrix}
 2 & 0 & 1 & 1 \\
 1 & 1 & 2 & 0 \\
 1 & 2 & 1 & 2
 \end{bmatrix}, \quad
-\mathbf{K}_{\text{raw}} = \mathbf{X}\mathbf{W}_K = \begin{bmatrix}
+\mathbf{K}_{\text{raw}} = \begin{bmatrix}
 1 & 1 & 2 & 0 \\
 0 & 2 & 1 & 1 \\
 2 & 1 & 1 & 2
 \end{bmatrix}, \quad
-\mathbf{V}_{\text{raw}} = \mathbf{X}\mathbf{W}_V = \begin{bmatrix}
+\mathbf{V}_{\text{raw}} = \begin{bmatrix}
 2 & 1 & 2 & 0 \\
 1 & 2 & 0 & 2 \\
 1 & 1 & 3 & 3
 \end{bmatrix}
 $$
 
-现在执行拆头（`[1, 3, 4] -> [1, 3, 2, 2] -> transpose(1,2) -> [1, 2, 3, 2]`），反映在纸面上，就是把上面每个 $3 \times 4$ 矩阵从中间竖着一分为二——左半边 $3 \times 2$ 归 **Head 1**，右半边 $3 \times 2$ 归 **Head 2**：
-
-- **Head 1（第 1 个头，形状 $[3, 2]$）**：
-  $$
-  \mathbf{Q}^{(1)} = \begin{bmatrix} 2 & 0 \\ 1 & 1 \\ 1 & 2 \end{bmatrix}, \quad
-  \mathbf{K}^{(1)} = \begin{bmatrix} 1 & 1 \\ 0 & 2 \\ 2 & 1 \end{bmatrix}, \quad
-  \mathbf{V}^{(1)} = \begin{bmatrix} 2 & 1 \\ 1 & 2 \\ 1 & 1 \end{bmatrix}
-  $$
-- **Head 2（第 2 个头，形状 $[3, 2]$）**：
-  $$
-  \mathbf{Q}^{(2)} = \begin{bmatrix} 1 & 1 \\ 2 & 0 \\ 1 & 2 \end{bmatrix}, \quad
-  \mathbf{K}^{(2)} = \begin{bmatrix} 2 & 0 \\ 1 & 1 \\ 1 & 2 \end{bmatrix}, \quad
-  \mathbf{V}^{(2)} = \begin{bmatrix} 2 & 0 \\ 0 & 2 \\ 3 & 3 \end{bmatrix}
-  $$
-
-### 第三步：注意力分数、掩码与加权求和
-
-我们先盯紧 **Head 1**。把 $\mathbf{K}^{(1)}$ 转置成 $2 \times 3$ 矩阵，与 $\mathbf{Q}^{(1)}$ 相乘（$[3, 2] \times [2, 3] \to [3, 3]$）：
+将其按列拆分为 **Head 1**（左半 $3 \times 2$）与 **Head 2**（右半 $3 \times 2$）：
 
 $$
-\mathbf{Q}^{(1)}(\mathbf{K}^{(1)})^\top =
-\begin{bmatrix} 2 & 0 \\ 1 & 1 \\ 1 & 2 \end{bmatrix}
-\begin{bmatrix} 1 & 0 & 2 \\ 1 & 2 & 1 \end{bmatrix}
-= \begin{bmatrix}
+\text{Head 1: } \mathbf{Q}^{(1)} = \begin{bmatrix} 2 & 0 \\ 1 & 1 \\ 1 & 2 \end{bmatrix}, \;
+\mathbf{K}^{(1)} = \begin{bmatrix} 1 & 1 \\ 0 & 2 \\ 2 & 1 \end{bmatrix}, \;
+\mathbf{V}^{(1)} = \begin{bmatrix} 2 & 1 \\ 1 & 2 \\ 1 & 1 \end{bmatrix}
+$$
+
+$$
+\text{Head 2: } \mathbf{Q}^{(2)} = \begin{bmatrix} 1 & 1 \\ 2 & 0 \\ 1 & 2 \end{bmatrix}, \;
+\mathbf{K}^{(2)} = \begin{bmatrix} 2 & 0 \\ 1 & 1 \\ 1 & 2 \end{bmatrix}, \;
+\mathbf{V}^{(2)} = \begin{bmatrix} 2 & 0 \\ 0 & 2 \\ 3 & 3 \end{bmatrix}
+$$
+
+### 2. 注意力分数、掩码与加权求和
+
+先计算 **Head 1** 的点积 $\mathbf{Q}^{(1)}(\mathbf{K}^{(1)})^\top$，除以 $\sqrt{2} \approx 1.414$ 并施加因果掩码（将 $j > i$ 置为 $-\infty$）：
+
+$$
+\mathbf{Q}^{(1)}(\mathbf{K}^{(1)})^\top = \begin{bmatrix}
 2 & 0 & 4 \\
 2 & 2 & 3 \\
 3 & 4 & 4
 \end{bmatrix}
-$$
-
-除以缩放因子 $\sqrt{d_h} = \sqrt{2} \approx 1.414$，并立刻盖上因果掩码 $\text{mask}$——把所有 $j > i$ 的右上角三个位置 $(0,1), (0,2), (1,2)$ 强行抹成 $-\infty$：
-
-$$
-\mathbf{S}_{\text{masked}}^{(1)} = \frac{\mathbf{Q}^{(1)}(\mathbf{K}^{(1)})^\top}{\sqrt{2}} + \text{mask} =
-\begin{bmatrix}
-\sqrt{2} & -\infty & -\infty \\
-\sqrt{2} & \sqrt{2} & -\infty \\
-\frac{3}{\sqrt{2}} & 2\sqrt{2} & 2\sqrt{2}
-\end{bmatrix}
-\approx
-\begin{bmatrix}
+\xrightarrow{\div\sqrt{2} + \text{mask}}
+\mathbf{S}_{\text{masked}}^{(1)} \approx \begin{bmatrix}
 1.414 & -\infty & -\infty \\
 1.414 & 1.414 & -\infty \\
 2.121 & 2.828 & 2.828
 \end{bmatrix}
 $$
 
-现在对每一行分别求 $\operatorname{softmax}$（记住 $e^{-\infty} = 0$）：
-- **第 0 行（`"我"`）**：只有第 0 列一个有效数字，其余两个全是 $0$。无论那个数字是多少，归一化后的概率必然是 **`[1.0, 0.0, 0.0]`**！因为第 0 个词前面没有任何历史，它百分之百只能看自己。
-- **第 1 行（`"喜欢"`）**：前两列的有效数字一模一样（都是 $\sqrt{2}$），第 2 列是 $-\infty$。两个相等的数做 Softmax，连计算器都不用按，概率必然平分，严格等于 **`[0.5, 0.5, 0.0]`**！
-- **第 2 行（`"写"`）**：三个位置都能看，数值为 $[2.121, 2.828, 2.828]$，求指数并除以行和，得到概率约为 **`[0.20, 0.40, 0.40]`**。
+对 $\mathbf{S}_{\text{masked}}^{(1)}$ 逐行求 $\operatorname{softmax}$：
 
-于是我们得到了 Head 1 的注意力权重方阵 $\mathbf{A}^{(1)} \in \mathbb{R}^{3 \times 3}$，并用它左乘 $\mathbf{V}^{(1)} \in \mathbb{R}^{3 \times 2}$：
+- **第 0 行（`"我"`）**：仅第 0 列有效，概率必为 `[1.0, 0.0, 0.0]`；
+- **第 1 行（`"喜欢"`）**：前两列数值相等，概率平分为 `[0.5, 0.5, 0.0]`；
+- **第 2 行（`"写"`）**：三列经指数归一化后约为 `[0.20, 0.40, 0.40]`。
+
+用所得权重方阵 $\mathbf{A}^{(1)}$ 左乘 $\mathbf{V}^{(1)}$：
 
 $$
 \mathbf{O}^{(1)} = \mathbf{A}^{(1)}\mathbf{V}^{(1)} =
@@ -968,13 +573,10 @@ $$
 \end{bmatrix}
 $$
 
-将同样的步骤施于 **Head 2**，两个子空间的分工便显现出来：
+同理计算 **Head 2**：
 
 $$
-\mathbf{Q}^{(2)}(\mathbf{K}^{(2)})^\top =
-\begin{bmatrix} 1 & 1 \\ 2 & 0 \\ 1 & 2 \end{bmatrix}
-\begin{bmatrix} 2 & 1 & 1 \\ 0 & 1 & 2 \end{bmatrix}
-= \begin{bmatrix}
+\mathbf{Q}^{(2)}(\mathbf{K}^{(2)})^\top = \begin{bmatrix}
 2 & 2 & 3 \\
 4 & 2 & 2 \\
 2 & 3 & 5
@@ -986,8 +588,6 @@ $$
 \sqrt{2} & \frac{3}{\sqrt{2}} & \frac{5}{\sqrt{2}}
 \end{bmatrix}
 $$
-
-请看第 1 行（`"喜欢"`）：在刚才的 Head 1 里，它对 `"我"` 和 `"喜欢"` 投去了完全均等的关注（`[0.5, 0.5, 0]`）；但在 Head 2 里，它对前一个词 `"我"` 的打分是 $2\sqrt{2} \approx 2.828$，而对自己的打分只有 $\sqrt{2} \approx 1.414$！经过 Softmax 后，Head 2 的权重矩阵 $\mathbf{A}^{(2)}$ 与加权输出 $\mathbf{O}^{(2)}$（保留两位小数）变成了：
 
 $$
 \mathbf{A}^{(2)} \approx \begin{bmatrix}
@@ -1003,11 +603,11 @@ $$
 \end{bmatrix}
 $$
 
-同一个位置 $t=1$，Head 1 在平均吸收前两个词的特征，而 Head 2 则把 80% 的权重分给了主语 `"我"`。
+对比第 1 行（`"喜欢"`）：Head 1 均等融合前两个词（`[0.5, 0.5, 0.0]`），而 Head 2 将 80% 的注意力集中在主语 `"我"` 上（`[0.80, 0.20, 0.00]`），直观体现了多头子空间的语义分工。
 
-### 第四步：合并多头与输出投影
+### 3. 多头拼接与代码核验
 
-最后，把 Head 1 的输出 $\mathbf{O}^{(1)}: [3, 2]$ 和 Head 2 的输出 $\mathbf{O}^{(2)}: [3, 2]$ 左右拼回一个 $3 \times 4$ 矩阵（即完整形状 $[1, 3, 4]$）：
+将 $\mathbf{O}^{(1)}$ 与 $\mathbf{O}^{(2)}$ 左右拼接回 $3 \times 4$ 矩阵：
 
 $$
 \mathbf{O}_{\text{concat}} = \begin{bmatrix} \mathbf{O}^{(1)} & \mathbf{O}^{(2)} \end{bmatrix} \approx
@@ -1018,74 +618,26 @@ $$
 \end{bmatrix}
 $$
 
-再右乘输出投影矩阵 $\mathbf{W}_O \in \mathbb{R}^{4 \times 4}$，就得到了注意力子层最终写回主干道的增量 $\Delta\mathbf{H}_{\text{attn}} \in \mathbb{R}^{[1, 3, 4]}$。每一格数字都来路清楚，没有任何黑盒。
-
-### 第五步：运行 --mode toy 核验结果
-
-刚才我们用纸笔算出了 $\mathbf{Q}_{\text{raw}}, \mathbf{K}_{\text{raw}}, \mathbf{V}_{\text{raw}}$、两个头的注意力概率 $\mathbf{A}^{(1)}, \mathbf{A}^{(2)}$ 以及合并后的 $\mathbf{O}_{\text{concat}}$。这段手算过程在代码里长什么样？
-
-现在你可以打开第 3 个源码文件 **`crates/llm-tracer/src/toy.rs`**（整个文件只有 83 行）。你会发现它没有任何多余包装，完全就是把我们刚才纸面上的矩阵和四步公式逐行翻译成了 Rust 代码：
+打开 `crates/llm-tracer/src/toy.rs`，可以看到上述四步手算过程在 Rust 中的直接映射：
 
 ```rust
-// crates/llm-tracer/src/toy.rs（完整代码逻辑）
-pub fn run_toy_verification(dev: &Device) -> Result<()> {
-    let (b, t, d, h, d_h) = (1, 3, 4, 2, 2);
+// crates/llm-tracer/src/toy.rs（核心计算片段）
+let q = q_raw.reshape((b, t, h, d_h))?.transpose(1, 2)?.contiguous()?;
+let k = k_raw.reshape((b, t, h, d_h))?.transpose(1, 2)?.contiguous()?;
+let v = v_raw.reshape((b, t, h, d_h))?.transpose(1, 2)?.contiguous()?;
 
-    // 第一步：用 Tensor::from_slice 构造 [1, 3, 4] 的输入隐藏状态 X（对应 "我"、"喜欢"、"写"）
-    let x = Tensor::from_slice(
-        &[
-            1.0f32, 0.0, 1.0, 0.0, // t=0 ("我")
-            0.0, 1.0, 1.0, 0.0,    // t=1 ("喜欢")
-            1.0, 1.0, 0.0, 1.0,    // t=2 ("写")
-        ],
-        (b, t, d),
-        dev,
-    )?;
-
-    // 第二步：构造 [4, 4] 的参数矩阵 W_Q, W_K, W_V，并相乘得到 Q_raw, K_raw, V_raw ([1, 3, 4])
-    // （此处略去 w_q_math, w_k_math, w_v_math 的常量数组定义，数值与上文纸面矩阵完全一致）
-    let q_raw = x.reshape((b * t, d))?.matmul(&w_q_math)?.reshape((b, t, d))?;
-    let k_raw = x.reshape((b * t, d))?.matmul(&w_k_math)?.reshape((b, t, d))?;
-    let v_raw = x.reshape((b * t, d))?.matmul(&w_v_math)?.reshape((b, t, d))?;
-
-    // 拆分成 h = 2 个注意力头，每头宽度 d_h = 2：[1, 3, 4] -> [1, 3, 2, 2] -> [1, 2, 3, 2]
-    let q = q_raw.reshape((b, t, h, d_h))?.transpose(1, 2)?.contiguous()?;
-    let k = k_raw.reshape((b, t, h, d_h))?.transpose(1, 2)?.contiguous()?;
-    let v = v_raw.reshape((b, t, h, d_h))?.transpose(1, 2)?.contiguous()?;
-
-    // 第三步：算 QK^T 除以 sqrt(2)，盖上因果掩码，做 Softmax 得到概率方阵，再乘 V
-    let scale = 1.0f64 / (d_h as f64).sqrt();
-    let scaled_scores = (&q.matmul(&k.t()?)? * scale)?;
-    let masked_scores = apply_causal_mask(&scaled_scores, 0)?;
-    let attn_probs = candle_nn::ops::softmax_last_dim(&masked_scores)?; // [1, 2, 3, 3]
-    let context = attn_probs.matmul(&v)?;                               // [1, 2, 3, 2]
-
-    // 第四步：把两个头重新拼回 [1, 3, 4]
-    let o_concat = context.transpose(1, 2)?.contiguous()?.reshape((b, t, d))?;
-
-    // 打印 Head 1 (下标 0,0)、Head 2 (下标 0,1) 的概率矩阵与拼接后的 O_concat
-    println!("{:?}", attn_probs.i((0, 0))?.to_vec2::<f32>()?);
-    println!("{:?}", attn_probs.i((0, 1))?.to_vec2::<f32>()?);
-    println!("{:?}", o_concat.i(0)?.to_vec2::<f32>()?);
-    Ok(())
-}
+let scale = 1.0f64 / (d_h as f64).sqrt();
+let scaled_scores = (&q.matmul(&k.t()?)? * scale)?;
+let masked_scores = apply_causal_mask(&scaled_scores, 0)?;
+let attn_probs = candle_nn::ops::softmax_last_dim(&masked_scores)?;
+let context = attn_probs.matmul(&v)?;
+let o_concat = context.transpose(1, 2)?.contiguous()?.reshape((b, t, d))?;
 ```
 
-看清了 `src/toy.rs` 的代码，现在在终端运行 `--mode toy`：
-
-```bash
-cargo run -- --mode toy
-```
-
-终端会立即打印出如下结果，你可以拿它和我们刚刚手算的每一个数字逐一比对，分毫不差：
+运行 `cargo run -- --mode toy`，终端输出与纸笔手算结果完全一致：
 
 ```text
 === Episode 0 Toy Hand-Calculation Verification (B=1, T=3, d=4, h=2, d_h=2) ===
-[02.Embedding  ] X (toy input states)                 | ACTIVATION | shape: [1, 3, 4]            | [+1.0000, +0.0000, +1.0000, +0.0000 ...]
-[04.AttnProj   ] Q_raw                                | ACTIVATION | shape: [1, 3, 4]            | [+2.0000, +0.0000, +1.0000, +1.0000 ...]
-[04.AttnProj   ] K_raw                                | ACTIVATION | shape: [1, 3, 4]            | [+1.0000, +1.0000, +2.0000, +0.0000 ...]
-[04.AttnProj   ] V_raw                                | ACTIVATION | shape: [1, 3, 4]            | [+2.0000, +1.0000, +2.0000, +0.0000 ...]
-
 --- Head 1 Attention Probs A^(1) [3x3] ---
 [[1.0, 0.0, 0.0], [0.5, 0.5, 0.0], [0.19777581, 0.40111208, 0.40111208]]
 --- Head 2 Attention Probs A^(2) [3x3] ---
@@ -1098,128 +650,69 @@ cargo run -- --mode toy
 
 ## 七、 残差流、MLP 与词表打分（阶段 07 — 11）
 
-注意力子层把跨位置收集来的上下文增量 $\Delta\mathbf{H}_{\text{attn}}: [B, T, d]$ 算好之后，这趟旅程进入了后半段。
+### 07. 残差连接、RMSNorm 与 SwiGLU MLP
 
-### 07. 归一化、残差连接与 MLP
-
-拿到 $\Delta\mathbf{H}_{\text{attn}}$ 后，模型并不会用它直接替换掉原来的输入 $\mathbf{H}^{(0)}$，而是做一个简单的**逐元素加法**——这就是贯穿整个 Transformer 的生命线：**残差连接（Residual Connection）**。
+注意力子层算出上下文增量 $\Delta\mathbf{H}_{\text{attn}}$ 后，通过**残差连接（Residual Connection）**直接叠加回输入主干：
 
 $$
 \mathbf{H}_{\text{mid}} = \mathbf{H}^{(0)} + \Delta\mathbf{H}_{\text{attn}}, \qquad \text{Shape: } [B, T, d]
 $$
 
-你可以把形状恒为 $[B, T, d]$ 的隐藏状态想象成一条从模型入口直通出口的宽阔传送带（即**残差流**）。注意力层所做的事，是从传送带上读取当前的向量，跨位置比对一番，然后把算出来的修正量 $\Delta\mathbf{H}_{\text{attn}}$ 叠加回传送带上。
+随后，$\mathbf{H}_{\text{mid}}$ 先经过 `post_attention_layernorm`（**RMSNorm 均方根归一化**）得到 $\mathbf{X}_{\text{norm}}: [B, T, d]$，再进入 **SwiGLU（Swish-Gated Linear Unit）前馈网络**。
 
-紧接着，传送带上的向量要经过第二次加工：**归一化（Normalization）与多层感知机（MLP / Feed-Forward Network）**。
+与跨位置交互的注意力层不同，MLP 仅在每个序列位置 $t$ 自身的向量上独立执行三步非线性变换：
 
-1. **归一化（LayerNorm 或现代模型标配的 RMSNorm）**：多层连续相加相乘很容易让激活数值越滚越大或趋近于零。归一化层对 $[B, T, d]$ 里每一个位置的 $d$ 维向量单独计算均方根，将其拉回标准尺度，再逐元素乘上一条长度为 $d$ 的可学习缩放参数向量 $\boldsymbol{\gamma} \in \mathbb{R}^d$。这一步进出形状严格保持 $[B, T, d]$。
-2. **MLP（前馈神经网络，现代模型标配 SwiGLU 门控线性单元）**：如果说刚才的注意力层负责的是**“跨位置搬运信息”**（让位置 $t$ 看到位置 $0 \dots t-1$），那么 MLP 负责的就是**“单位置内部的特征非线性变换与知识提取”**。在 MLP 内部，不同序列位置 $t$ 之间没有任何交互，计算完全在每个位置自己的 $d$ 维向量上独立展开。
-   我们在第二节体检时看到每层 MLP 包含 **`gate_proj`、`up_proj`、`down_proj` 三张参数矩阵**，它们共同构成了 **SwiGLU（Swish-Gated Linear Unit，Swish 门控线性单元）**，按如下三步对归一化后的输入 $\mathbf{X}_{\text{norm}}: [B, T, 576]$ 做变换：
-   - **第一步（双路并联升维投影 `576 -> 1536`）**：$\mathbf{X}_{\text{norm}}$ 同时右乘两张形状为 `[1536, 576]` 的转置权重矩阵——一路乘 $\mathbf{W}_{\text{up}}^\top$ 得到升维候选特征表示 $\mathbf{U} = \mathbf{X}_{\text{norm}}\mathbf{W}_{\text{up}}^\top: [B, T, 1536]$；另一路乘 $\mathbf{W}_{\text{gate}}^\top$ 并经过我们在前置篇第六节学过的 **$\operatorname{SiLU}(x) = x \cdot \sigma(x)$ 非线性激活函数**，得到门控激活张量 $\mathbf{G} = \operatorname{SiLU}(\mathbf{X}_{\text{norm}}\mathbf{W}_{\text{gate}}^\top): [B, T, 1536]$；
-   - **第二步（Hadamard 逐元素门控调制 `[B, T, 1536]`）**：将门控支路 $\mathbf{G}$ 与候选特征支路 $\mathbf{U}$ 做 **Hadamard 逐元素乘法（$\mathbf{G} \odot \mathbf{U}$，代码中为 `&gate * &up`）**，通过双线性门控机制动态抑制无关特征分量、放行关键特征组合；
-   - **第三步（降维线性投影 `1536 -> 576`）**：将门控调制后的 `[B, T, 1536]` 右乘第三张矩阵 $\mathbf{W}_{\text{down}}^\top$（原形状 `[576, 1536]` 转置为 `[1536, 576]`），重新映射回残差流维度 $\Delta\mathbf{H}_{\text{mlp}}: [B, T, 576]$：
+1. **双路升维投影（$576 \to 1536$）**：$\mathbf{X}_{\text{norm}}$ 同时右乘 $\mathbf{W}_{\text{up}}^\top$ 得到候选特征 $\mathbf{U} = \mathbf{X}_{\text{norm}}\mathbf{W}_{\text{up}}^\top$，右乘 $\mathbf{W}_{\text{gate}}^\top$ 并经 $\operatorname{SiLU}(x) = x\sigma(x)$ 激活得到门控张量 $\mathbf{G} = \operatorname{SiLU}(\mathbf{X}_{\text{norm}}\mathbf{W}_{\text{gate}}^\top)$，两者形状均为 $[B, T, 1536]$；
+2. **Hadamard 逐元素门控**：计算逐元素乘积 $\mathbf{G} \odot \mathbf{U}: [B, T, 1536]$，动态过滤并调制特征分量；
+3. **降维线性投影（$1536 \to 576$）**：右乘 $\mathbf{W}_{\text{down}}^\top$ 还原回 $[B, T, 576]$，并再次与残差流相加：
 
 $$
-\Delta\mathbf{H}_{\text{mlp}} = \big(\operatorname{SiLU}(\mathbf{X}_{\text{norm}}\mathbf{W}_{\text{gate}}^\top) \odot (\mathbf{X}_{\text{norm}}\mathbf{W}_{\text{up}}^\top)\big)\mathbf{W}_{\text{down}}^\top, \qquad \text{Shape: } [B, T, d]
+\Delta\mathbf{H}_{\text{mlp}} = \big(\operatorname{SiLU}(\mathbf{X}_{\text{norm}}\mathbf{W}_{\text{gate}}^\top) \odot (\mathbf{X}_{\text{norm}}\mathbf{W}_{\text{up}}^\top)\big)\mathbf{W}_{\text{down}}^\top, \qquad \mathbf{H}^{(1)} = \mathbf{H}_{\text{mid}} + \Delta\mathbf{H}_{\text{mlp}}
 $$
-
-最后，再做一次残差相加，第 0 层 Transformer Block 宣告结束：
-
-$$
-\mathbf{H}^{(1)} = \mathbf{H}_{\text{mid}} + \Delta\mathbf{H}_{\text{mlp}}, \qquad \text{Shape: } [B, T, d]
-$$
-
-看到这里，一个自然的疑问是：为什么进这一层前是 $[B, T, d]$，先后走完注意力与 MLP 两套矩阵运算，出来依然是 $[B, T, d]$？
-
-答案正在于：**维度是容器的规格，而数值是容器里装的表示。** 进去时的 $\mathbf{H}^{(0)}$ 只装着孤立的字面特征；经过一次“注意力跨位置聚合”加一次“MLP 位置内非线性提纯”，出来的 $\mathbf{H}^{(1)}$ 虽然容器尺寸没变，但每个位置向量里已经融合了第一层上下文语境。
-
-**本阶段对应的 `config.json` 超参数：**
-
-- `"rms_norm_eps": 1e-05`：RMSNorm 均方根归一化公式 $\operatorname{RMSNorm}(\mathbf{x}) = \frac{\mathbf{x}}{\sqrt{\frac{1}{d}\sum_{i=1}^d x_i^2 + \epsilon}} \odot \boldsymbol{\gamma}$ 分母中的数值稳定常数 $\epsilon = 10^{-5}$，用于防止均方根趋近于 $0$ 时发生浮点除零溢出；
-- `"intermediate_size": 1536`：MLP 前馈网络的中间升维宽度 $d_{ff} = 1536$，直接决定了每层 `gate_proj.weight` 与 `up_proj.weight` 的形状为 `[1536, 576]`、`down_proj.weight` 的形状为 `[576, 1536]`；
-- `"hidden_act": "silu"` 与 `"mlp_bias": false`：指定 SwiGLU 门控分支采用 $\operatorname{SiLU}(x) = x \cdot \sigma(x)$ 激活函数，且 MLP 的三个线性层均不带 `.bias` 偏置向量。
 
 ### 08. 串联多层 Transformer
 
-正因为单个 Transformer 层严格遵守“吃进 $[B, T, d]$、吐出 $[B, T, d]$”的接口契约，整个主干网络才能把 $L$ 层结构相同的 Transformer Block 直接串联起来：
+由于单层 Transformer 严格保持输入与输出形状均为 $[B, T, d]$，主干网络将 $L = 30$ 层结构相同的模块直接串联：
 
 $$
-\mathbf{H}^{(0)} \xrightarrow{\text{Layer } 0} \mathbf{H}^{(1)} \xrightarrow{\text{Layer } 1} \mathbf{H}^{(2)} \longrightarrow \cdots \longrightarrow \mathbf{H}^{(L-1)} \xrightarrow{\text{Layer } L-1} \mathbf{H}^{(L)} \quad (\text{全程保持 } [B, T, d])
+\mathbf{H}^{(0)} \xrightarrow{\text{Layer } 0} \mathbf{H}^{(1)} \xrightarrow{\text{Layer } 1} \cdots \xrightarrow{\text{Layer } 29} \mathbf{H}^{(30)} \xrightarrow{\text{Final RMSNorm}} \mathbf{H}_{\text{final}}: [B, T, d]
 $$
 
-第 0 层、第 1 层直到第 $L-1$ 层，虽然张量形状分毫未变，但每一层都拥有自己独立训练出的一套参数矩阵（$\mathbf{W}_Q^{(\ell)}, \mathbf{W}_K^{(\ell)}, \mathbf{W}_V^{(\ell)}, \mathbf{W}_O^{(\ell)}$ 以及各自的 MLP 权重）。浅层往往在建立局部的词法与短语搭配，中层在梳理跨句子的指代与逻辑结构，深层则在把信息逐步收敛到“接下来该预测什么词”的方向上。
+走出第 29 层后，张量经过第 272 个权重 `model.norm.weight` 完成最终均方根归一化，得到 $\mathbf{H}_{\text{final}}: [B, T, d]$。
 
-当激活张量走出最后一层（第 $L-1$ 层）并经过最后一道全局归一化（Final RMSNorm，即我们在开箱体检里看到的第 272 个张量 `model.norm.weight`）后，我们拿到了最终隐藏状态 $\mathbf{H}_{\text{final}}: [B, T, d]$。
+### 09. 输出投影（LM Head）与权重绑定
 
-**本阶段对应的 `config.json` 超参数：**
-
-- `"num_hidden_layers": 30`：决定堆叠层数 $L = 30$（对应权重文件中的 `model.layers.0` 至 `model.layers.29`）；
-- `"architectures": ["LlamaForCausalLM"]` 与 `"model_type": "llama"`：向推理引擎声明模型架构类型，使其按标准 Llama 解码器结构组装计算图（附带的 `"pretraining_tp": 1` 表示预训练时的张量并行度为 1，权重未做跨卡切分）。
-
-### 09. 输出投影（LM Head）
-
-现在，传送带走到了尽头。我们手里有每个位置的 $d$ 维特征向量，但屏幕上的用户不需要 $d$ 个浮点数，用户需要的是词表里那 $V$ 个候选词中的一个。
-
-怎么把 $d$ 维向量翻译回 $V$ 个候选词的打分？
-
-还记得阶段 02 进门时的词嵌入矩阵 $\mathbf{W}_E \in \mathbb{R}^{V \times d}$ 吗？进门时，我们用 Token ID 去查 $d$ 维向量；出门时，我们刚好把这个过程反过来——放下一张在 `.safetensors` 中形状同为 $[V, d]$、在数学运算中转置为 $[d, V]$ 的**语言模型头参数矩阵（LM Head）** $\mathbf{W}_{\text{head}}^\top$。
-
-这里藏着一个与模型体积息息相关的工程分水岭——**词表权重绑定（Weight Tying，配置项为 `tie_word_embeddings`）**：
-
-- **在 3B 及以下的轻量级模型中（`tie_word_embeddings: true`）**：如 `SmolLM2-135M`、`Qwen2.5-0.5B`、`Llama-3.2-1B`、`Gemma-3-1B`。由于现代词表极其庞大（例如 `Qwen2.5-0.5B` 的词表 $V = 151,936$，仅一张 $[151936, 896]$ 的词嵌入表就占去全模型总参数的 $27.56\%$；若首尾各自独立存一张表，光这一进一出就要吞噬 $55.1\%$ 的参数预算），这些小模型无一例外将首尾词表绑定。如果你打开它们的 `model.safetensors`，会发现里面**根本不存在 `lm_head.weight` 这个键**——出口处的 $\mathbf{W}_{\text{head}}$ 在物理内存里直接复用了入口处 `model.embed_tokens.weight` 的同一个张量指针。
-- **在 7B 及以上的中大型模型中（`tie_word_embeddings: false`）**：如 `Qwen2.5-7B/32B`、`Llama-3.1-8B/405B`。此时参数预算充裕，为了避免同一个矩阵在反向传播时同时承受第 0 层特征提取与末端分类器两股方向迥异的梯度拉扯、并消除跨节点流水线并行（Pipeline Parallelism）的首尾同步开销，`embed_tokens.weight` 与 `lm_head.weight` 才正式分家，成为两张各自独立的 $[V, d]$ 矩阵。
-
-让最终隐藏状态 $\mathbf{H}_{\text{final}}: [B, T, d]$ 右乘 $\mathbf{W}_{\text{head}}^\top: [d, V]$，内积消去了隐藏维度 $d$，词表维度 $V$ 豁然展开：
+为了将 $d = 576$ 维特征向量转化为词表 $V = 49,152$ 个候选词的预测得分，模型将 $\mathbf{H}_{\text{final}}$ 右乘**语言模型输出头（LM Head）**转置矩阵 $\mathbf{W}_{\text{head}}^\top \in \mathbb{R}^{d \times V}$，得到**未归一化对数概率（Logits）**：
 
 $$
 \text{logits}_{\text{all}} = \mathbf{H}_{\text{final}} \mathbf{W}_{\text{head}}^\top, \qquad \text{Shape: } [B, T, d] \times [d, V] \longrightarrow [B, T, V]
 $$
 
-这个形状为 $[B, T, V]$ 的动态激活张量叫做 **Logits（未归一化对数概率）**。在它的每一个位置 $t$ 上，都整齐地排列着 $V$ 个实数——第 $k$ 个实数越大，代表模型认为词表里第 $k$ 号 Token 接在这个位置后面的可能性越高。
+> **首尾词表权重绑定（Weight Tying）**：
+> - **3B 及以下轻量模型（`tie_word_embeddings: true`）**：如 `SmolLM2-135M`、`Qwen2.5-0.5B`、`Llama-3.2-1B`。由于词表矩阵占比极高（本模型单张表即占总参数的 21.05%），出口处的 $\mathbf{W}_{\text{head}}$ 直接复用阶段 02 入口处的词嵌入矩阵 $\mathbf{W}_E$，因此在 `.safetensors` 中不存在独立的 `lm_head.weight` 键；
+> - **7B 及以上中大型模型（`tie_word_embeddings: false`）**：参数预算充裕，为避免首尾梯度互相干扰并便于跨卡流水线并行，入口 `embed_tokens.weight` 与出口 `lm_head.weight` 解绑为两张独立矩阵。
 
 ### 10. 选出下一个 Token
 
-看着形状为 $[B, T, V]$ 的 $\text{logits}_{\text{all}}$，一个问题随之浮现：我们明明只想要预测整句话后面的**那一个**新词，为什么模型一口气算出了全部 $T$ 个位置的 $V$ 维打分？前 $T-1$ 行的打分是干什么用的？
+在 $\text{logits}_{\text{all}}: [B, T, V]$ 中，第 $t$ 行的 $V$ 个分数代表模型在看到前 $t+1$ 个词后对下一个词的预测（训练阶段利用全部 $T$ 行并行计算交叉熵损失）。
 
-这正是因果掩码留下的结构印记：
-
-- 在位置 $t = 0$（只看到了 `"我"`），模型算出的第 0 行 $[1, V]$ 分数，是在预测 `"我"` 后面该接什么词；
-- 在位置 $t = 1$（看到了 `"我 喜欢"`），模型算出的第 1 行 $[1, V]$ 分数，是在预测 `"我 喜欢"` 后面该接什么词；
-- 只有到了最后一个位置 $t = T - 1$（看全了整句输入 `"我 喜欢 写"`），模型算出的最后一行 $[1, V]$ 分数，才是在预测整句话后面的**下一个词**。
-
-在训练阶段，前 $T-1$ 行的打分至关重要——因为训练语料里本来就有第 1 个词 `"喜欢"` 和第 2 个词 `"写"`，模型可以同时拿全部 $T$ 行的预测跟标准答案对比算交叉熵损失，用一次前向传播同时完成 $T$ 个预测任务的训练。但在**推理生成阶段**，前 $T-1$ 个词本来就是用户已经敲进去的已知文本，不需要模型再去重猜一遍。
-
-因此在推理的第 10 站，前 $T-1$ 行被直接舍弃，只切出序列维度的最后一行（下标 $T-1$）：
+而在推理阶段，前 $T-1$ 个词已是已知输入，因此直接切出序列最后一个位置（下标 $T-1$），并通过 $\arg\max$（贪心解码）选出得分最高的 Token ID：
 
 $$
-\text{logits}_{\text{last}} = \text{logits}_{\text{all}}[:, T-1, :], \qquad \text{Shape: } [B, T, V] \xrightarrow{\text{取末位切片}} [B, V]
+\text{logits}_{\text{last}} = \text{logits}_{\text{all}}[:, T-1, :] \in \mathbb{R}^{[B, V]}, \qquad \text{next\_id} = \arg\max(\text{logits}_{\text{last}})
 $$
 
-拿到这长度为 $V$ 的打分向量后，经过温度缩放（Temperature）与 Softmax 转换成概率分布 $\mathbf{p} \in \mathbb{R}^{[B, V]}$。如果我们采用最简单的贪心解码（Greedy Decoding，即直接取 $\arg\max$ 挑出分数最高的那一列），就会立刻得到一个整数编号——比如第 `5` 号 Token（`"代码"`）。
+### 11. 自回归生成循环（Autoregressive Loop）
 
-至此，一次完整的前向计算全部走完。文本 `"我 喜欢 写"` 穿过了所有层参数矩阵，得到了下一个词 `"代码"`（Token ID `5`）。
-
-### 11. 自回归生成循环
-
-既然算一次前向传播只能拿到 1 个新 Token，那大模型写出一篇五百字的文章是怎么做到的？
-
-答案是：**把刚刚生成的那个新 Token 拼回输入序列的末尾，再跑一遍前向计算。**
-
-1. 第 1 轮：输入 `[1, 3, 4]`（`"我 喜欢 写"`，长 $3$） $\xrightarrow{\text{前向计算}}$ 吐出 `5`（`"代码"`）；
-2. 第 2 轮：把 `5` 拼上去，输入变成 `[1, 3, 4, 5]`（`"我 喜欢 写 代码"`，长 $4$） $\xrightarrow{\text{前向计算}}$ 吐出下一个 Token；
-3. 如此循环往复，直到模型在某一步挑中了代表结束的特殊词元 `<|im_end|>`（EOS Token），循环终止。
-
-这种“拿自己上一步的输出当作下一步的输入”的循环方式，就叫做**自回归生成（Autoregressive Generation）**。大模型的千言万语，全是一次又一次前向计算接力跑出来的。
+单次前向计算仅产出一个新 Token。大模型生成长文的过程，就是将刚生成的 Token ID 拼接到输入序列末尾，循环执行下一轮前向计算，直至命中终止符 `<|im_end|>`（EOS Token）。
 
 ---
 
-## 八、 教学玩具与工业模型的差异
+## 八、 教学模型与现代开源架构对比
 
-刚才我们用标准多头注意力（MHA）走通了主线。但如果你现在打开 Hugging Face 上主流开源模型——如 `SmolLM2`、`Llama-3.2`、`Qwen2.5` 或 `Gemma-3`——的权重文件与源码，会发现现代工业界在不改动 `[B, T] -> [B, T, d] -> [B, T, V]` 这一宏观张量契约的前提下，对内部算子做了六处结构性重塑。
+现代开源架构（Llama / Qwen / SmolLM2）在保持 `[B, T] -> [B, T, d] -> [B, T, V]` 主干契约不变的前提下，相对于早期 GPT-2 教学模型完成了六项标准化演进：
 
-**我们不能把教学模型的所有形状和操作顺序直接套到所有真实模型上。** 在把 Rust 探针插进真实模型之前，我们先通过下表看清这六处结构偏移（它们的深层数学推导与硬件 Roofline 瓶颈将在《第 2 篇｜深入 Transformer》中展开，本篇只锁定它们对张量形状与参数列表的影响）：
-
-| 演进维度 | 经典教学模型 (GPT-2) | 现代开源架构 (Llama / SmolLM2) | 权重与激活形状变化 |
+| 演进维度 | 早期教学模型 (GPT-2) | 现代开源架构 (Llama / SmolLM2) | 权重与激活形状影响 |
 |---|---|---|---|
 | **1. 归一化** | Post-LayerNorm（含 `bias`） | **Pre-RMSNorm**（无 `bias`） | 移除偏置 `[d]`，形状守恒为 `[B, T, d]` |
 | **2. 位置编码** | 绝对位置编码 $\mathbf{W}_{\text{pos}}: [T_{\max}, d]$ | **旋转位置编码 (RoPE)** | 移除 $\mathbf{W}_{\text{pos}}$，在 `[B, h, T, d_h]` 上原地旋转 |
@@ -1228,7 +721,7 @@ $$
 | **5. 线性层偏置** | 全部保留 `.bias: [d_out]` | **普遍移除 (`bias=False`)** | 移除一维偏置向量 |
 | **6. 首尾词表** | 强制绑定 | **3B 以下绑定，7B 以上解绑** | 3B 以下无 `lm_head.weight` 独立键 |
 
-进一步对比当前主流的四个轻量级开源模型，各家尺寸配置如下表所示：
+横向对比四款主流轻量级开源模型的架构尺寸：
 
 | 指标 | `SmolLM2-135M` | `Qwen2.5-0.5B` | `Llama-3.2-1B` | `Gemma-3-1B` |
 |---|---|---|---|---|
@@ -1238,230 +731,149 @@ $$
 | **词表大小 $V$** | $49,152$（绑定） | $151,936$（绑定） | $128,256$（绑定） | $262,144$（绑定） |
 | **张量总数 / 体积** | **272 个** / 269 MB | **290 个** / 988 MB | **146 个** / 2.47 GB | **340 个** / 2.0 GB |
 
-对比上面四台模型的工程细节：
-- **`SmolLM2-135M`**：100% 纯正零偏置 Llama 架构，无任何非标怪癖，269 MB 权重在普通笔记本 CPU 上不到 0.3 秒即可跑完；
-- **`Qwen2.5-0.5B`**：与 `SmolLM2` 几乎一致，仅在每层的 `q/k/v_proj` 保留了一维 `.bias` 偏置向量（每层 12 个张量）；
-- **`Llama-3.2-1B`**：启用了 `llama3` 分段波长 RoPE 缩放以支持长上下文；
-- **`Gemma-3-1B`**：存在多处异构设计——其查询头总宽度 $4 \times 256 = 1024 \neq 1152$（非方阵投影），Embedding 查表后需额外乘 $\sqrt{1152}$，采用 `(1 + w)` 偏移版 RMSNorm，且每层额外包含 QK-Norm 与 5:1 混合滑动窗口注意力（每层 13 个张量）。
-
-正因为 `SmolLM2-135M-Instruct` 百分之百采用最干净的标准 `LlamaForCausalLM` 架构（全模型零偏置、272 个张量整整齐齐、269 MB 权重在普通笔记本 CPU 上不到 0.3 秒即可跑完），我们选它作为 Rust 白盒追踪的主讲靶机；同时读者只需在 QKV 投影后加一行偏置加法，就能直接无缝切换到 `Qwen2.5-0.5B`。
+- **`SmolLM2-135M`**：零偏置标准 Llama 架构，CPU 仅需 0.3 秒即可跑完，是最佳白盒追踪基准；
+- **`Qwen2.5-0.5B`**：与 `SmolLM2` 结构一致，仅在每层 `q/k/v_proj` 保留了一维 `.bias` 偏置向量（每层 12 个张量）；
+- **`Llama-3.2-1B`**：启用 `llama3` 分段波长 RoPE 缩放以支持长上下文；
+- **`Gemma-3-1B`**：查询头总宽 $4 \times 256 = 1024 \neq 1152$，包含 QK-Norm 与 5:1 混合滑动窗口注意力（每层 13 个张量）。
 
 ---
 
 ## 九、 真机前向追踪示例
 
-现在，我们用 Rust（基于 `candle-core` 与 `candle-nn`）把探针插进 `SmolLM2-135M-Instruct`，验证真实模型的前向过程。
+现在我们打开 `crates/llm-tracer` 的最后两个源码文件：`src/ops.rs` 与 `src/model.rs`。
 
-这里直接应用我们在前置篇掌握的两条张量法则（线性层三维激活先降维为 `[B * T, d_in]`、右乘转置权重 `w.t()?`、再升维回 `[B, T, d_out]`；拆头执行 `.transpose(1, 2)?` 后调用 `.contiguous()?` 排齐物理内存），此外只需注意一个模型细节：**RoPE 的半区配对约定**。`SmolLM2`、`Llama-3.2` 与 `Qwen2.5` 在 `.safetensors` 格式下全部遵循非交错半区配对（`rotate_half`）——即单头维度 $d_h = 64$ 的前半区 `[0..32]` 与后半区 `[32..64]` 配对旋转，对应调用 `candle_nn::rotary_emb::rope`（传入形状为 `[T, 32]` 的 `cos` 和 `sin` 表）。
+### 1. 基础算子实现（src/ops.rs）
 
-### 1. 核心源码拆解（ops.rs 与 model.rs）
-
-到目前为止，我们已经看完了 `llm-tracer` 5 个源码文件中的前 3 个（`main.rs`、`inspect.rs`、`toy.rs`）。现在我们打开最后两个核心文件——**`src/ops.rs`（104 行）** 与 **`src/model.rs`（248 行）**，把整座大模型前向推理的每一行代码彻底看穿。
-
-#### （1）src/ops.rs：探针与基础算子
-
-你可能会惊讶：跑通一整座现代 Llama 架构大模型，底层到底需要写几个数学算子函数？
-
-答案是：**只要 5 个函数，加起来不到 100 行代码。** 打开 `src/ops.rs`，里面从上到下依次是 `trace` 打印器和这 5 个基础算子：
+跑通整座 Llama 架构大模型，底层只需实现 **5 个数学算子函数**（共 104 行）：
 
 ```rust
-// crates/llm-tracer/src/ops.rs（完整代码与逐函数解析）
-use candle_core::{DType, Device, Result, Tensor};
+// crates/llm-tracer/src/ops.rs（5 个核心算子）
 
-#[derive(Clone, Copy)]
-pub enum Role {
-    Weight,     // 静态参数矩阵：形状只含 (V, d, h, d_h, d_ff)，绝不含 B 与 T
-    Activation, // 动态中间激活：形状必含批大小 B 与序列长度 T
-    KvCache,    // 键值缓存：跨步保存历史位置的 K 与 V 激活张量
-}
-
-/// 探针打印函数：按 [阶段名] 张量名 | 角色 | 形状 | [前 4 个浮点数...] 格式输出一行追踪记录
-pub fn trace(stage: &str, name: &str, role: Role, t: &Tensor) -> Result<()> {
-    let role_tag = match role {
-        Role::Weight => "WEIGHT    ",
-        Role::Activation => "ACTIVATION",
-        Role::KvCache => "KV_CACHE  ",
-    };
-    let elem_count = t.elem_count().min(4);
-    let flat_slice = t.flatten_all()?.narrow(0, 0, elem_count)?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-    let head: Vec<String> = flat_slice.iter().map(|v| format!("{:+.4}", v)).collect();
-    println!(
-        "[{:<14}] {:<36} | {} | shape: {:<20} | [{} ...]",
-        stage, name, role_tag, format!("{:?}", t.dims()), head.join(", ")
-    );
-    Ok(())
-}
-
-/// 算子 1 —— 无偏置线性投影：将 [B, T, d_in] 展平为 [B*T, d_in]，乘转置权重 [d_in, d_out]，再还原为 [B, T, d_out]
+/// 1. 无偏置线性投影：[B, T, d_in] -> [B*T, d_in] x [d_in, d_out] -> [B, T, d_out]
 pub fn linear_no_bias(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
     let (b, t, d_in) = x.dims3()?;
     let (d_out, _) = weight.dims2()?;
     x.reshape((b * t, d_in))?.matmul(&weight.t()?)?.reshape((b, t, d_out))
 }
 
-/// 算子 2 —— RMSNorm 均方根归一化：x / sqrt(mean(x^2) + eps) * weight，进出形状保持 [B, T, d]
+/// 2. RMSNorm 均方根归一化：x / sqrt(mean(x^2) + eps) * weight
 pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
     candle_nn::ops::rms_norm(x, weight, eps as f32)
 }
 
-/// 算子 3 —— 预计算 RoPE 旋转位置编码的余弦 (cos) 与正弦 (sin) 查找表（形状均为 [max_seq_len, d_h / 2]）
-pub fn precompute_rope_tables(
-    max_seq_len: usize,
-    d_h: usize,
-    theta: f32,
-    dev: &Device,
-) -> Result<(Tensor, Tensor)> {
-    let half = d_h / 2; // 单头 64 维两两配对，共有 32 组旋转频率
-    let inv_freq: Vec<f32> = (0..half)
-        .map(|i| 1.0 / theta.powf((2 * i) as f32 / d_h as f32))
-        .collect();
+/// 3. 预计算 RoPE 余弦与正弦查找表（形状均为 [max_seq_len, d_h / 2]）
+pub fn precompute_rope_tables(max_seq_len: usize, d_h: usize, theta: f32, dev: &Device) -> Result<(Tensor, Tensor)> {
+    let half = d_h / 2;
+    let inv_freq: Vec<f32> = (0..half).map(|i| 1.0 / theta.powf((2 * i) as f32 / d_h as f32)).collect();
     let inv_freq = Tensor::from_vec(inv_freq, (1, half), dev)?;
     let positions: Vec<f32> = (0..max_seq_len).map(|p| p as f32).collect();
     let t = Tensor::from_vec(positions, (max_seq_len, 1), dev)?;
-    let freqs = t.matmul(&inv_freq)?; // 外积：[max_seq_len, 1] x [1, 32] -> [max_seq_len, 32]
+    let freqs = t.matmul(&inv_freq)?;
     Ok((freqs.cos()?, freqs.sin()?))
 }
 
-/// 算子 4 —— GQA 键值头复制扩展：将 [B, h_kv, T, d_h] 的每个键值头连续复制 n_rep 次，对齐为 [B, h_q, T, d_h]
+/// 4. GQA 键值头复制扩展：[B, h_kv, T, d_h] -> [B, h_q, T, d_h]
 pub fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
-    if n_rep == 1 {
-        return Ok(x.clone());
-    }
+    if n_rep == 1 { return Ok(x.clone()); }
     let (b, h_kv, seq_len, d_h) = x.dims4()?;
-    x.unsqueeze(2)?
-        .expand((b, h_kv, n_rep, seq_len, d_h))?
-        .reshape((b, h_kv * n_rep, seq_len, d_h))
+    x.unsqueeze(2)?.expand((b, h_kv, n_rep, seq_len, d_h))?.reshape((b, h_kv * n_rep, seq_len, d_h))
 }
 
-/// 算子 5 —— 上三角因果掩码：将所有 j > i + offset（偷看未来）的位置设为负无穷 -inf
+/// 5. 上三角因果掩码：将 j > i + offset 的未来位置置为 -inf
 pub fn apply_causal_mask(scores: &Tensor, offset: usize) -> Result<Tensor> {
     let (b, h, q_len, kv_len) = scores.dims4()?;
-    if q_len == 1 {
-        return Ok(scores.clone()); // Decode 阶段每次只进 1 个新词，它本来就能看前面所有词，无需掩码
-    }
+    if q_len == 1 { return Ok(scores.clone()); }
     let mut mask_vec = vec![0.0f32; q_len * kv_len];
     for i in 0..q_len {
-        for j in 0..kv_len {
-            if j > i + offset {
-                mask_vec[i * kv_len + j] = f32::NEG_INFINITY;
-            }
+        for j in (i + offset + 1)..kv_len {
+            mask_vec[i * kv_len + j] = f32::NEG_INFINITY;
         }
     }
-    let mask = Tensor::from_vec(mask_vec, (1, 1, q_len, kv_len), scores.device())?
-        .broadcast_as((b, h, q_len, kv_len))?;
+    let mask = Tensor::from_vec(mask_vec, (1, 1, q_len, kv_len), scores.device())?.broadcast_as((b, h, q_len, kv_len))?;
     scores.broadcast_add(&mask)
 }
 ```
 
-#### （2）src/model.rs：11 阶段推理引擎
+### 2. 11 阶段前向主循环（src/model.rs）
 
-有了 `src/ops.rs` 里的 5 个算子，我们打开 `src/model.rs`。这个文件里只有两个函数：上半部分是执行一次完整前向推理（阶段 01 到阶段 10）的 **`forward_step`**，下半部分是驱动分词与两步生成循环的 **`run_real_trace`**（我们会在第十节结合 KV Cache 拆解下半部分）。
-
-先看 `forward_step` 的完整实现——从阶段 01 拿到 `input_ids`，到阶段 02 用 `index_select` 查表，再到 `for l in 0..30` 循环跑完 30 层 Transformer，最后在阶段 09/10 算出 `logits` 并用 `argmax` 挑出最高分词号，全程一气呵成：
+`src/model.rs` 中的 `forward_step` 函数将上述 5 个算子串联为阶段 01 — 10 的完整前向计算：
 
 ```rust
-// crates/llm-tracer/src/model.rs —— 上半部分：forward_step 完整实现
+// crates/llm-tracer/src/model.rs —— forward_step 核心实现
 pub fn forward_step(
     step_label: &str,
-    input_ids: &Tensor,                        // 输入词号张量：Prefill 时为 [1, 10]，Decode 时为 [1, 1]
-    offset: usize,                             // 起始位置偏移：Prefill 时为 0，Decode 时为 10
+    input_ids: &Tensor,
+    offset: usize,
     cfg: &LlamaConfig,
     weights: &HashMap<String, Tensor>,
     cos_all: &Tensor,
     sin_all: &Tensor,
-    kv_caches: &mut [Option<(Tensor, Tensor)>], // 30 层的 KV 缓存槽位
+    kv_caches: &mut [Option<(Tensor, Tensor)>],
 ) -> Result<u32> {
     let (b, seq_len) = input_ids.dims2()?;
     let (d, h_q, h_kv, d_h) = (cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim());
-    let n_rep = h_q / h_kv; // 9 / 3 = 3（每 3 个查询头共享 1 组键值头）
+    let n_rep = h_q / h_kv;
 
-    // 【阶段 01 & 02】输入 Token IDs -> 从 model.embed_tokens.weight ([49152, 576]) 按行查表得到初始残差流 [B, T, 576]
-    trace("01.Tokens", "input_ids", Role::Activation, input_ids)?;
+    // 阶段 01 & 02：Embedding 按行查表 [B, T] -> [B, T, 576]
     let w_embed = get_tensor(weights, "model.embed_tokens.weight")?;
-    trace("02.Embedding", "model.embed_tokens.weight", Role::Weight, w_embed)?;
-    let flat_ids = input_ids.flatten_all()?;
-    let mut hidden = w_embed.index_select(&flat_ids, 0)?.reshape((b, seq_len, d))?;
-    trace("02.Embedding", "X_0 (embedded hidden state)", Role::Activation, &hidden)?;
+    let mut hidden = w_embed.index_select(&input_ids.flatten_all()?, 0)?.reshape((b, seq_len, d))?;
 
-    // 【阶段 03 准备】按当前位置窗口 [offset .. offset + seq_len] 切出对应的 RoPE cos/sin 表
     let cos = cos_all.narrow(0, offset, seq_len)?;
     let sin = sin_all.narrow(0, offset, seq_len)?;
 
-    // 【阶段 03 — 08】循环穿过全部 30 层 Transformer（仅在第 0 层打印内部拆解日志，避免 30 层重复刷屏）
+    // 阶段 03 — 08：循环穿过 30 层 Transformer
     for (l, kv_slot) in kv_caches.iter_mut().enumerate().take(cfg.num_hidden_layers) {
         let p = format!("model.layers.{l}");
-        let trace_layer = l == 0;
 
-        // 1. 进入第一车间（自注意力）前：先过 input_layernorm (Pre-RMSNorm)
-        let w_ln1 = get_tensor(weights, &format!("{p}.input_layernorm.weight"))?;
-        let x_norm = rms_norm(&hidden, w_ln1, cfg.rms_norm_eps)?;
+        // 自注意力子层：Pre-RMSNorm -> QKV 投影与拆头 -> RoPE 旋转 -> KV Cache 拼接 -> GQA 注意力 -> W_O 投影 + 残差
+        let x_norm = rms_norm(&hidden, get_tensor(weights, &format!("{p}.input_layernorm.weight"))?, cfg.rms_norm_eps)?;
+        let q = linear_no_bias(&x_norm, get_tensor(weights, &format!("{p}.self_attn.q_proj.weight"))?)?
+            .reshape((b, seq_len, h_q, d_h))?.transpose(1, 2)?.contiguous()?;
+        let k = linear_no_bias(&x_norm, get_tensor(weights, &format!("{p}.self_attn.k_proj.weight"))?)?
+            .reshape((b, seq_len, h_kv, d_h))?.transpose(1, 2)?.contiguous()?;
+        let v = linear_no_bias(&x_norm, get_tensor(weights, &format!("{p}.self_attn.v_proj.weight"))?)?
+            .reshape((b, seq_len, h_kv, d_h))?.transpose(1, 2)?.contiguous()?;
 
-        // 2. 【阶段 04】乘 W_Q, W_K, W_V 投影矩阵，并拆头转置为 [B, h, T, 64]
-        let q_lin = linear_no_bias(&x_norm, get_tensor(weights, &format!("{p}.self_attn.q_proj.weight"))?)?; // [B, T, 576]
-        let k_lin = linear_no_bias(&x_norm, get_tensor(weights, &format!("{p}.self_attn.k_proj.weight"))?)?; // [B, T, 192]
-        let v_lin = linear_no_bias(&x_norm, get_tensor(weights, &format!("{p}.self_attn.v_proj.weight"))?)?; // [B, T, 192]
-
-        let q = q_lin.reshape((b, seq_len, h_q, d_h))?.transpose(1, 2)?.contiguous()?;  // [B, 9, T, 64]
-        let k = k_lin.reshape((b, seq_len, h_kv, d_h))?.transpose(1, 2)?.contiguous()?; // [B, 3, T, 64]
-        let v = v_lin.reshape((b, seq_len, h_kv, d_h))?.transpose(1, 2)?.contiguous()?; // [B, 3, T, 64]
-
-        // 3. 【阶段 03/04】对 Q 和 K 施加 RoPE 旋转位置编码（V 不旋转，形状不变）
         let q_rope = candle_nn::rotary_emb::rope(&q, &cos, &sin)?;
         let k_rope = candle_nn::rotary_emb::rope(&k, &cos, &sin)?;
 
-        // 4. 【KV Cache 拼接】若本层已有历史缓存，则沿序列维度（dim = 2）把新算出的 K/V 拼在历史缓存末尾
         let (k_cache, v_cache) = match kv_slot.take() {
             Some((prev_k, prev_v)) => (Tensor::cat(&[&prev_k, &k_rope], 2)?, Tensor::cat(&[&prev_v, &v], 2)?),
             None => (k_rope, v),
         };
         *kv_slot = Some((k_cache.clone(), v_cache.clone()));
 
-        // 5. 【阶段 05】GQA 键值头 3->9 广播 + 缩放点积 QK^T/sqrt(64) + 因果掩码 + Softmax + 乘 V
         let k_full = repeat_kv(&k_cache, n_rep)?;
         let v_full = repeat_kv(&v_cache, n_rep)?;
-        let scale = 1.0f64 / (d_h as f64).sqrt();
-        let attn_scores = (q_rope.matmul(&k_full.t()?)? * scale)?;
-        let masked_scores = apply_causal_mask(&attn_scores, offset)?;
-        let attn_probs = candle_nn::ops::softmax_last_dim(&masked_scores)?;
-        let context = attn_probs.matmul(&v_full.contiguous()?)?;
+        let attn_scores = (q_rope.matmul(&k_full.t()?)? * (1.0 / (d_h as f64).sqrt()))?;
+        let attn_probs = candle_nn::ops::softmax_last_dim(&apply_causal_mask(&attn_scores, offset)?)?;
+        let o_concat = attn_probs.matmul(&v_full.contiguous()?)?.transpose(1, 2)?.contiguous()?.reshape((b, seq_len, d))?;
+        let h_mid = (&hidden + &linear_no_bias(&o_concat, get_tensor(weights, &format!("{p}.self_attn.o_proj.weight"))?)?)?;
 
-        // 6. 【阶段 06】多头合并回 [B, T, 576]，乘 W_O 输出矩阵，并加回残差流（第一次残差相加）
-        let o_concat = context.transpose(1, 2)?.contiguous()?.reshape((b, seq_len, d))?;
-        let attn_out = linear_no_bias(&o_concat, get_tensor(weights, &format!("{p}.self_attn.o_proj.weight"))?)?;
-        let h_mid = (&hidden + &attn_out)?;
-
-        // 7. 【阶段 07】进入第二车间（SwiGLU MLP）：过 post_attention_layernorm -> gate * up 升维到 1536 -> down 压回 576 -> 第二次残差相加
+        // SwiGLU MLP 子层：Pre-RMSNorm -> SiLU(gate) * up -> down + 残差
         let h_norm = rms_norm(&h_mid, get_tensor(weights, &format!("{p}.post_attention_layernorm.weight"))?, cfg.rms_norm_eps)?;
         let gate = candle_nn::ops::silu(&linear_no_bias(&h_norm, get_tensor(weights, &format!("{p}.mlp.gate_proj.weight"))?)?)?;
         let up = linear_no_bias(&h_norm, get_tensor(weights, &format!("{p}.mlp.up_proj.weight"))?)?;
         let mlp_out = linear_no_bias(&(&gate * &up)?, get_tensor(weights, &format!("{p}.mlp.down_proj.weight"))?)?;
-        hidden = (&h_mid + &mlp_out)?; // 更新主干残差流，送入下一层 l + 1
+        hidden = (&h_mid + &mlp_out)?;
     }
 
-    // 【阶段 08】走出第 29 层后，经过第 272 个张量 model.norm.weight 做最终归一化校准
+    // 阶段 08 — 10：最终归一化 -> LM Head 词表投影 -> 取末位 argmax
     let h_final = rms_norm(&hidden, get_tensor(weights, "model.norm.weight")?, cfg.rms_norm_eps)?;
-    trace("08.RepeatL30", "X_30 (after 30 layers + norm)", Role::Activation, &h_final)?;
-
-    // 【阶段 09】LM Head 输出投影：直接复用入口的 w_embed ([49152, 576])，将 [B, T, 576] 映射为词表得分 [B, T, 49152]
     let logits = linear_no_bias(&h_final, w_embed)?;
-    trace("09.LM_Head", "Logits [B, T, V]", Role::Activation, &logits)?;
-
-    // 【阶段 10】只取序列最后一个位置 (seq_len - 1) 的 49152 维得分，用 argmax 挑出最高分的 Token ID
-    let last_logits = logits.i((0, seq_len - 1))?;
-    let next_token_id = last_logits.argmax(0)?.to_scalar::<u32>()?;
-    Ok(next_token_id)
+    logits.i((0, seq_len - 1))?.argmax(0)?.to_scalar::<u32>()
 }
 ```
 
-### 2. 真机运行日志拆解
+### 3. 运行 --mode real 观察 Step 1 日志
 
-现在，我们在仓库根目录下（或在 `crates/llm-tracer` 目录下）运行 `--mode real`，把刚刚下载的 `SmolLM2-135M-Instruct` 真实权重与阶段 01 拆解过的那句对话序列 `<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n`（共 $B = 1, T = 10$ 个 Token：`[1, 4093, 198, 19556, 2, 198, 1, 520, 9531, 198]`）喂给探针：
+在终端执行真机追踪：
 
 ```bash
 cargo run -- --mode real
 ```
 
-终端上会完整打印出 **Step 1（Prefill 预填充，处理 10 个输入词并吐出第 1 个回答词）** 与 **Step 2（Decode 自回归解码，喂入刚生成的第 1 个回答词并吐出第 2 个词）** 的真实追踪日志：
+终端首先打印 **Step 1（Prefill 预填充阶段，输入 10 个 Prompt Token）** 的追踪日志：
 
 ```text
 [01.Tokenizer ] Raw prompt: "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
@@ -1506,80 +918,29 @@ cargo run -- --mode real
 [10.Decoded    ] Step 1 generated token 19556 -> "Hello"
 ```
 
-上面这段真机运行日志信息量极大，我们把它的列格式和关键节点逐一拆开来看：
+日志清晰印证了前文的三条核心规律：
 
-1. **每一行的四列分别代表什么？**
-   每一行追踪日志都按 **`[阶段名] 张量名 | 角色 (WEIGHT / ACTIVATION / KV_CACHE) | 形状 (shape) | [前 4 个浮点数切片 ...]`** 的格式打印。其中最右边方括号里的 4 个小数，是程序把该张量展平后取出的**最开头前 4 个真实数值**。例如你看第 3 行 `[02.Embedding] X_0` 的前三个数 `[-0.0255, -0.0192, -0.0396]`，正是第 1 个词元 `<|im_start|>`（Token ID `1`）从词嵌入表第 `1` 行查出来的真实浮点数！
-2. **静态权重与动态激活一眼可辨**：
-   凡是标着 `WEIGHT` 的行，形状里只有 `49152`、`576`、`192`、`1536` 这些架构常数，完全没有批大小 `1` 和序列长度 `10`；而且你看倒数第 5 行 `[09.LM_Head] lm_head.weight` 的前四个数 `[-0.1060, +0.0342, +0.0476, -0.0239]`，与第 2 行 `[02.Embedding] model.embed_tokens.weight` 完全相同——因为首尾共享了同一个矩阵。反过来，凡是标着 `ACTIVATION` 的行，形状无一例外带着批大小 `1` 和序列长度 `10`（如 `[1, 10, 576]`、拆成 9 个查询头后的 `[1, 9, 10, 64]`、3 个键值头的 `[1, 3, 10, 64]`）。
-3. **第六节的手算规律在真机上原样重现**：
-   看 `[05.Attention] Scores` 那一行，第 0 行的后三个元素全是 `-inf`（因果掩码把未来位置全部屏蔽）；紧接着在下一行 `Probs (Softmax)` 里，前四个数字变成了 `[+1.0000, +0.0000, +0.0000, +0.0000 ...]`——因此再下一行 `Context (Probs * V)` 的前四个数字 `[-0.0210, +0.0031, -0.0384, -0.0375]` 与前面 `V_lin` 的前四个数字分毫不差！这和我们在第六节用纸笔手算出的“第 0 个词只能 100% 吸收自己的 $\mathbf{V}$ 向量”完全一致。
-4. **为什么从第 0 层输出 `X_1` 直接跳到了第 30 层输出 `X_30`？**
-   在 `X_1 (Layer 0 output)` 之后，第 1 层到第 29 层在 `for layer_idx in 0..30` 循环里执行的矩阵运算和形状变化与第 0 层 100% 相同。为了避免在终端刷出七百多行重复形状的日志，探针完整展示了第 0 层的内部细节，随后静默跑完第 1 至 29 层及最终的 `model.norm.weight`，直接打印出走完 30 层后的总输出 `[08.RepeatL30] X_30`（形状依然是 `[1, 10, 576]`，但里面的数值已经变成了 `[-0.7521, -0.1531, ...]`）。
-5. **最后三行：真机是如何挑出第一个回答词 `"Hello"` 的？**
-   - 在 `[09.LM_Head]`，30 层算完的 `X_30`（`[1, 10, 576]`）乘上转置后的词嵌入矩阵（`[576, 49152]`），算出了全部 10 个位置在 49,152 个候选词上的得分 `Logits`（形状 `[1, 10, 49152]`）；
-   - 在 `[10.SelectNext]`，程序只切出最后一行（即第 10 个词元 `\n` 所在位置，形状 `[49152]`），在 49,152 个候选得分里找出最大值（`Greedy argmax`），发现得分最高的是第 **`19556`** 号（得分高达 `+31.8`）；
-   - 在 `[10.Decoded]`，拿整数 `19556` 去反查我们在第二节打开过的 `tokenizer.json` 词表，第 `19556` 号词元恰恰就是向用户问好的英文单词 **`"Hello"`**！
+- **维度铁律**：所有 `WEIGHT` 行均不含批大小 `1` 与序列长 `10`；所有 `ACTIVATION` 行均携带 `1` 与 `10`。
+- **因果掩码效应**：`Scores` 第 0 行后三个元素全为 `-inf`，`Probs` 变为 `[+1.0000, +0.0000, ...]`，使得 `Context` 的前 4 个浮点数 `[-0.0210, +0.0031, -0.0384, -0.0375]` 与 `V_lin` 完全相同。
+- **首词解码**：30 层输出 `X_30` 乘转置词表后，末位 `last_logits` 在第 `19556` 列取得最高分，反查 `tokenizer.json` 解码出首个回答词 **`"Hello"`**。
 
 ---
 
 ## 十、 Prefill、Decode 与 KV Cache
 
-如果故事到这里就结束，当我们进入阶段 11 的自回归循环去生成 `"Hello"` 后面的标点符号时，就会遭遇一场算力灾难。
+在生成 `"Hello"` 之后的第二个词时，如果把全部 11 个 Token 重新从头算一遍，前 10 个历史 Token 的所有投影与注意力都会被白白重复计算。
 
-试想：第 1 轮我们输入了 10 个 Token，算完 30 层得到了第 11 个 Token（`19556`, `"Hello"`）；到了第 2 轮，如果我们把全部 11 个 Token（`[1, 11]`）重新从头喂进模型，那么前 10 个 Token 的 Embedding、前 10 个 Token 在每一层的 $\mathbf{Q}, \mathbf{K}, \mathbf{V}$ 投影、以及前 10 个 Token 之间的注意力，全都得一模一样地重算一遍！生成到第 1000 个词时，每吐出一个新字都要把前面 999 个词重算一遍。
+### 1. 为什么只需缓存 K 和 V？
 
-等等——前 10 个 Token 的计算结果，在第 11 个 Token 加进来之后，真的会变吗？
+由于阶段 05 **因果掩码**的存在，前 10 个 Token 根本看不见第 11 个 Token——无论后面追加多少新词，前 10 个位置在各层的隐藏状态及键向量 $\mathbf{K}_{1..10}$、值向量 $\mathbf{V}_{1..10}$ 永远不会改变。
 
-回想一下阶段 05 的**因果掩码**。因为上三角全被抹成了 $-\infty$，前 10 个 Token 在计算注意力时**根本看不见第 11 个 Token**！也就是说，无论后面追加了多少个新词，前 10 个位置在每一层算出来的隐藏状态、以及它们对应的键向量 $\mathbf{K}_{1..10}$ 和值向量 $\mathbf{V}_{1..10}$，**连小数点后最后一位都不会发生任何改变**。
+为了计算第 11 个位置的注意力输出，我们只需用**第 11 个位置自身的查询向量 $\mathbf{q}_{11}: [1, 9, 1, 64]$**，与全部 11 个位置的键矩阵 $\mathbf{K}_{1..11}: [1, 3, 11, 64]$ 和值矩阵 $\mathbf{V}_{1..11}: [1, 3, 11, 64]$ 相乘即可。
 
-既然前 10 个位置的隐藏状态已经用过了（我们只需要预测第 11 个位置后面的词，只需要算最后一行 `last_logits`），那在第 11 个位置的计算过程中，到底有哪些阶段需要用到前 10 个位置的数据？
+因此，**KV Cache（键值缓存）** 只需在显存中保存各层历史位置的 $\mathbf{K}_{\text{rope}}$ 与 $\mathbf{V}$ 激活张量，历史位置的 $\mathbf{Q}$ 用完即弃。
 
-翻看整张流程图，答案只有一个地方：**阶段 05 的注意力计算**！
+### 2. Step 2（Decode 阶段）真机日志
 
-为了算出第 11 个位置（下标 $t=10$）的注意力输出，我们只需要第 11 个位置自己的查询向量 $\mathbf{q}_{11}: [1, 9, 1, 64]$，去和**全部 11 个位置（前 10 个历史位置 + 当前第 11 个位置）**的键向量 $\mathbf{K}_{1..11}: [1, 3, 11, 64]$ 做点积，再对全部 11 个位置的值向量 $\mathbf{V}_{1..11}: [1, 3, 11, 64]$ 做加权求和。
-
-这就是 **KV Cache（键值缓存）** 的全部秘密：
-
-- **它缓存了什么？** 它缓存的既不是模型的静态权重，也不是整个隐藏状态，而是每一层 Transformer Attention 中已经算过的历史位置的 **$\mathbf{K}$ 激活张量和 $\mathbf{V}$ 激活张量**（对 $\mathbf{K}$ 而言是施加 RoPE 旋转之后的张量，且直接按未广播的 $h_{kv} = 3$ 个键值头存储以节省显存）。
-- **为什么不缓存 $\mathbf{Q}$？** 因为历史位置的 $\mathbf{Q}_{1..10}$ 只用来预测历史位置自己的下一个词，那些词早就生成完了，后续步骤永远不会再回头去查旧的 $\mathbf{Q}$。
-
-现在我们打开 `crates/llm-tracer/src/model.rs` 的下半部分，看懂最后一个函数 **`run_real_trace`**。它把 `tokenizer.json` 的分词/反查与两次 `forward_step`（Step 1 Prefill 喂 10 个词，`offset = 0`；Step 2 Decode 只喂 1 个新词，`offset = 10`）串联在了一起：
-
-```rust
-// crates/llm-tracer/src/model.rs —— 下半部分：run_real_trace 完整实现
-pub fn run_real_trace(model_dir: &Path, dev: &Device) -> Result<()> {
-    let (cfg, weights) = load_config_and_weights(model_dir, dev)?;
-    let (cos_all, sin_all) = precompute_rope_tables(128, cfg.head_dim(), cfg.rope_theta, dev)?;
-    let mut kv_caches: Vec<Option<(Tensor, Tensor)>> = vec![None; cfg.num_hidden_layers]; // 30 层初始为空
-
-    // 1. 加载 tokenizer.json，将 ChatML 对话模板编码为 10 个整数 Token ID
-    let tok = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
-    let raw_prompt = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n";
-    let enc = tok.encode(raw_prompt, false).unwrap();
-    let prompt_ids: Vec<u32> = enc.get_ids().to_vec(); // [1, 4093, 198, 19556, 2, 198, 1, 520, 9531, 198]
-
-    // 2. Step 1 (Prefill)：一次性喂入全部 10 个输入词（形状 [1, 10]，offset = 0），填满 30 层 KV Cache
-    let prefill_input = Tensor::from_slice(&prompt_ids, (1, prompt_ids.len()), dev)?;
-    let first_generated_id = forward_step(
-        "STEP 1: PREFILL (T = 10 ChatML prompt tokens)",
-        &prefill_input, 0, &cfg, &weights, &cos_all, &sin_all, &mut kv_caches,
-    )?; // 返回 19556 ("Hello")
-
-    // 3. Step 2 (Decode)：只喂入刚生成的 1 个新词（形状 [1, 1]，offset = 10），直接复用并追加 KV Cache
-    let decode_input = Tensor::from_slice(&[first_generated_id], (1, 1), dev)?;
-    let second_generated_id = forward_step(
-        "STEP 2: AUTOREGRESSIVE DECODE (T_new = 1, KV Cache 10 -> 11)",
-        &decode_input, prompt_ids.len(), &cfg, &weights, &cos_all, &sin_all, &mut kv_caches,
-    )?; // 返回 17 ("!")
-
-    let full_reply = tok.decode(&[first_generated_id, second_generated_id], false).unwrap();
-    println!("[11.Summary    ] First 2 generated tokens decoded: {:?}", full_reply); // "Hello!"
-    Ok(())
-}
-```
-
-紧接着刚才的 Step 1，你看探针输出的 **Step 2（Decode 自回归解码）** 真机日志，就能亲眼看到序列维度从 `10` 瞬间塌缩为 `1`、而 KV Cache 从 `10` 增长到 `11` 的全过程：
+在 `--mode real` 输出的下半部分，模型仅喂入刚生成的单Token `[19556]`（形状 `[1, 1]`，`offset = 10`）：
 
 ```text
 ==========================================================================================
@@ -1601,44 +962,32 @@ pub fn run_real_trace(model_dir: &Path, dev: &Device) -> Result<()> {
 [11.Summary    ] First 2 generated tokens decoded: "Hello!"
 ```
 
-你看 Step 2 的最后三行：模型只喂入了 `[1, 1]`（即刚生成的 `19556` `"Hello"`），与 KV Cache 里的 10 个历史词元拼成 `[1, 3, 11, 64]` 后，算出了下一个最高分词号 **`17`**——回头看一眼我们在开篇贴出的那段 `tokenizer.json` 真实切片，第 `17` 号词元恰恰就是感叹号 **`"!"`**！两步合起来，模型干净利落地吐出了 **`"Hello!"`**。
+Step 2 选出最高分 Token ID `17`（`"!"`），与 Step 1 的 `"Hello"` 拼接输出 **`"Hello!"`**。
 
-一旦开启 KV Cache，大模型的推理过程就自然劈成了两个性格截然不同的阶段：
+### 3. Prefill 与 Decode 的形状对比
+
+开启 KV Cache 后，推理过程自然分为两个阶段：
 
 | 追踪节点 | Prefill 阶段（$T=10$） | Decode 阶段（$T_{\text{new}}=1$） |
 |---|---|---|
-| **本次输入 `input_ids`** | `[1, 10]` | **`[1, 1]`** |
+| **输入 `input_ids`** | `[1, 10]` | **`[1, 1]`** |
 | **层间隐藏状态 $\mathbf{H}$** | `[1, 10, 576]` | **`[1, 1, 576]`** |
-| **新投影出的 $\mathbf{Q}_{\text{new}}$** | `[1, 9, 10, 64]` | **`[1, 9, 1, 64]`** |
-| **新投影出的 $\mathbf{K}_{\text{new}}, \mathbf{V}_{\text{new}}$** | `[1, 3, 10, 64]` | **`[1, 3, 1, 64]`** |
-| **拼接后完整 $\mathbf{K}_{\text{all}}, \mathbf{V}_{\text{all}}$** | `[1, 3, 10, 64]`（广播后 `[1, 9, 10, 64]`） | **`[1, 3, 11, 64]`**（广播后 `[1, 9, 11, 64]`） |
-| **注意力分数 $\mathbf{Q}_{\text{new}}\mathbf{K}_{\text{all}}^\top$** | **`[1, 9, 10, 10]`**（$10 \times 10$ 方阵） | **`[1, 9, 1, 11]`**（$1 \times 11$ 单行向量） |
-| **注意力合并输出 $\mathbf{O}_{\text{concat}}$** | `[1, 10, 576]` | **`[1, 1, 576]`** |
-| **MLP 升维 / Logits 输出** | `[1, 10, 1536]` $\to$ `[1, 10, 49152]` | **`[1, 1, 1536]`** $\to$ **`[1, 1, 49152]`** |
+| **新投影 $\mathbf{Q}_{\text{new}}$** | `[1, 9, 10, 64]` | **`[1, 9, 1, 64]`** |
+| **新投影 $\mathbf{K}_{\text{new}}, \mathbf{V}_{\text{new}}$** | `[1, 3, 10, 64]` | **`[1, 3, 1, 64]`** |
+| **拼接后 $\mathbf{K}_{\text{all}}, \mathbf{V}_{\text{all}}$** | `[1, 3, 10, 64]` | **`[1, 3, 11, 64]`** |
+| **注意力分数 $\mathbf{Q}_{\text{new}}\mathbf{K}_{\text{all}}^\top$** | **`[1, 9, 10, 10]`**（二维方阵） | **`[1, 9, 1, 11]`**（单行向量） |
+| **MLP 升维 / Logits** | `[1, 10, 1536]` $\to$ `[1, 10, 49152]` | **`[1, 1, 1536]`** $\to$ **`[1, 1, 49152]`** |
 
-对比上表中的两列形状变化：
-- **在 Prefill 阶段**：一次性喂入整句 Prompt 的 10 个词，算出的 $\mathbf{K}, \mathbf{V}$ 直接填满各层 KV Cache，注意力分数是 `[1, 9, 10, 10]` 的二维方阵（需盖上三角因果掩码）；
-- **在 Decode 阶段**：每步只喂入最新生成的 1 个词（`[1, 1]`），新算出的 `[1, 3, 1, 64]` 追加拼接到历史缓存尾部变成 `[1, 3, 11, 64]`，而注意力分数直接缩成了 `[1, 9, 1, 11]` 的单行向量（因为第 11 个词本来就能看全部 `1..11` 个词，连掩码都省了）。哪怕历史上下文已经累积到了 `4096` 个词，Decode 每一步流过线性层和 MLP 的激活张量永远只有薄薄的一行 `[1, 1, d]`。至于这种从“方阵乘矩阵（Prefill，计算受限 Compute-Bound）”到“向量乘矩阵（Decode，访存带宽受限 Memory-Bound）”的变化如何在硬件层面决定推理性能，留待后续的系统优化篇深入剖析。
-
-**本阶段对应的 `config.json` 超参数（阶段 09 — 11 收官）：**
-
-- `"tie_word_embeddings": true`：使阶段 09 的输出投影头 `lm_head` 与阶段 02 的词嵌入矩阵 `embed_tokens` 共享同一块物理内存；
-- `"use_cache": true`：控制自回归解码时默认启用 **KV Cache**；
-- `"transformers.js_config"` 与 `"transformers_version"`：记录导出时的 `transformers` 库版本及 WebGPU 端 KV 缓存的 `float16` 精度配置。至此，`config.json` 中的全部超参数均已与具体算子一一对应。
+- **Prefill（计算受限 Compute-Bound）**：一次性并行处理整句 Prompt，做矩阵乘矩阵运算并填满 KV Cache；
+- **Decode（访存带宽受限 Memory-Bound）**：每步仅输入 1 个新词，线性层与 MLP 的激活退化为单行向量 `[1, 1, d]`，主要耗时花在从显存搬运庞大的权重与历史 KV Cache 上。
 
 ---
 
 ## 十一、 前沿对标：DeepSeek-V4.1-Flash
 
-到这里，我们已经把 `SmolLM2-135M-Instruct` 这台 1.35 亿参数的稠密模型从头到尾拆解完毕。但你可能立刻会问：**今天工业界最前沿的旗舰级模型——例如 DeepSeek 在 2026 年 10 月 17 日发布的 `DeepSeek-V4.1-Flash-1017`（5520 亿总参数、支持 100 万 Token 上下文）——和我们今天学的这台小模型相比，究竟改了什么？我们刚建立的张量坐标系，在它身上还管用吗？**
+掌握了 `SmolLM2-135M` 的 11 阶段流转后，我们来看工业界前沿旗舰模型 **`DeepSeek-V4.1-Flash-1017`**（5520 亿总参数、支持 100 万 Token 上下文，词表 $V = 129,280$、隐藏维度 $d = 5120$、层数 $L = 40$）。
 
-先说结论：**宏观的张量主干契约丝毫未变，但它在我们刚才走过的四个最痛的算力与显存瓶颈处，动了四刀精准的外科手术。**
-
-如果你打开 Hugging Face 上 `DeepSeek-V4.1-Flash-1017` 的官方 `config.json`（`model_type: deepseek_v41_text`），会看到一组极其眼熟的基础维度：词表大小 $V = 129,280$，隐藏层宽度 $d = 5120$，总层数 $L = 40$。
-
-当一句文本进入模型时，它依然在阶段 02 查表变成 `[B, T, 5120]` 的初始残差流，穿过 40 层网络后，依然在阶段 09 乘上输出矩阵变成 `[B, T, 129280]` 的词表分数。你今天掌握的“静态权重不含 $B/T$、动态激活必含 $B/T$”的铁律，在 5520 亿参数的模型上依然百分之百成立。
-
-那它凭什么能装下 5520 亿参数、一口气读完 100 万个 Token（`max_position_embeddings = 1,048,576`），却还能冠以“Flash”之名实现极高吞吐与低廉成本？我们把它的架构配置与今天学的 `SmolLM2-135M` 放在同一张桌子上对比，四处演进一目了然：
+它的宏观主干依然是 `[B, T] -> [B, T, 5120] -> [B, T, 129280]`，但在四个核心算力与显存瓶颈处实施了外科手术式演进：
 
 | 演进部位 | `SmolLM2-135M`（今日基准） | `DeepSeek-V4.1-Flash-1017`（前沿标杆） | 解决的核心瓶颈 |
 |---|---|---|---|
@@ -1647,60 +996,61 @@ pub fn run_real_trace(model_dir: &Path, dev: &Device) -> Result<()> {
 | **3. 注意力与 KV 缓存** | 标准 GQA（FP16/BF16 缓存） | **MLA 低秩压缩 + CSA2 稀疏 + FP4 量化** | 全局 KV 压至 **890 Bytes/词** |
 | **4. 自回归解码步进** | 单步串行吐 1 词 | **DSpark 投机解码 + `1017` RL 思维链精简** | 一次验真多词，减少总输出步数 |
 
-顺着我们在前十节建立的流程图，你可以非常直观地看懂这四刀手术：
+### 1. 阶段 07 演进：MoE 专家路由与 Engram 条件记忆
 
-1. **第一刀切在阶段 07 的 MLP 上（MoE 专家路由 + Engram 条件记忆）**：
-   在 `SmolLM2` 里，每个 Token 到了阶段 07 都要穿过同一组 `gate/up/down` 矩阵。如果把这组矩阵直接放大几千倍，显卡算力会立刻见底。
-   `DeepSeek-V4.1-Flash` 的解法是把单层 MLP 拆成 **1 个全勤的共享专家（捕获通用语法与共性常识）和 384 个术业有专攻的路由专家**。当 `[B, T, 5120]` 的隐藏状态抵达时，先乘一个极小的路由矩阵算出 384 个专家的匹配分，每个词只唤醒得分最高的 **6 个专家**做 SwiGLU 计算；此外，它把我们在阶段 02 见过的“按 Token ID 查表”升级为 **1960 亿参数的 Engram 条件记忆模块**——那些死记硬背的静态事实直接通过稀疏查表取出，连矩阵乘法都省了。
-2. **第二刀切在阶段 08 的层堆叠上（CED 非对称因果编码-解码器）**：
-   今天你在写代码或跑智能体（如 Terminal-Bench、DeepSWE）时，喂给模型的仓库上下文动辄十几万 Token（Prefill 极重），而模型每次只需输出几十行补丁（Decode 较轻）。传统纯 Decoder 模型逼着所有输入 Token 跑满全部层。
-   而 `DeepSeek-V4.1-Flash` 把 40 层劈成 **20 层因果编码器 + 20 层解码器**，让 Prefill 阶段每个词只激活 **80 亿（8B）参数**快速消化长文，并在第 20 层编码器出口直接投影生成供后 20 层解码器复用的全局 KV Cache；等到真正开口写代码（Decode）时，才启用 **160 亿（16B）激活参数**保证生成质量。
-3. **第三刀切在第十节的 KV Cache 显存墙上（MLA + CSA2 + FP4 量化）**：
-   我们在第十节算过，Decode 阶段每吐一个词都要把历史所有位置的 $\mathbf{K}_{\text{all}}, \mathbf{V}_{\text{all}}$ 从显存搬进计算单元。
-   为了在 100 万 Token 长度下不爆显存，DeepSeek 先用 **MLA（多头潜在注意力）** 将键值张量压入低维潜在向量（并将需要施加 RoPE 的维度单独切分为 `qk_rope_head_dim = 64`，避免旋转编码破坏低秩矩阵合并），再用 **CSA2（第二代压缩稀疏注意力）** 将不同层设为 `Full`（全注意力）、`Reindex`（重算稀疏索引）或 `Reuse`（直接跨层复用上一层的 Top-K 稀疏位置索引），最后叠加上 **FP4（E2M1 格式）缓存量化**与滑动窗口有界重放（SWA Bounded Replay）。这一套组合下来，单个 Token 在整座模型里的 KV Cache 占用被压到了惊人的 **890 字节**。
-4. **第四刀切在阶段 11 的自回归循环与输出策略上（DSpark 投机解码 + `1017` 后训练对齐）**：
-   为了打破阶段 11“跑一次全模型只能蹦一个字”的串行瓶颈，它结合了 **DSpark 半自回归投机解码**，一次猜出多个后续 Token 并利用矩阵乘法的并行性一次验真。
-   而在 10 月 17 日更新的 **`1017` 版本**中，模型主干架构保持不变，研发团队通过基于自反馈的后训练强化学习（RL）重塑了它的推理与代码生成习惯——让模型少说废话、缩短无效的中间试错路径，用更少的输出步数直接命中工程交付目标。
+在稠密模型中，每个 Token 在阶段 07 都要乘完整的 MLP 矩阵。`DeepSeek-V4.1-Flash` 将单层 MLP 拆分为 **1 个共享专家 + 384 个路由专家**，每个词仅通过轻量路由矩阵唤醒得分最高的 **6 个专家**参与计算；同时引入 **1960 亿参数的 Engram 条件记忆模块**，通过稀疏查表直接提取静态事实知识，省去大量矩阵乘法。
 
-你会发现，哪怕面对最新、最复杂的 5520 亿参数前沿模型，只要你手里握着今天这张 **11 阶段前向计算地图**，所有的架构创新都不再是晦涩的论文黑话——它们不过是在问：**怎么在 `[B, T, d]` 流向 `[B, T, V]` 的路上，少算一点矩阵乘法（MoE / CED）、少存一点 KV 激活（MLA / CSA2 / FP4）、少跑几轮串行循环（DSpark / RL 精简）？**
+### 2. 阶段 08 演进：CED 非对称因果编码-解码器
 
-这也是为什么今年斯坦福大学新开的 **CS146S（《现代软件开发者》，*The Modern Software Developer*）** 与哈佛大学的 **CS2680（《现代 AI 系统：智能体与系统优化》，*Modern AI Systems: Agents and System Optimizations*）** 不约而同地把“上层智能体工程（如 Claude Code、Codex、上下文工程与 MCP）”和“底层推理系统（Prefill/Decode 分离、KV Cache 前缀复用、投机解码与 MoE 路由）”绑在同一门课里讲授。
+针对智能体与代码场景“长文输入（Prefill 重）、短补丁输出（Decode 轻）”的特征，模型将 40 层划分为 **20 层因果编码器 + 20 层解码器**。Prefill 阶段每个词仅激活 **8B 参数**快速消化长上下文，并在第 20 层出口直接生成全局 KV Cache；Decode 阶段则激活 **16B 参数**保障代码与推理生成质量。
 
-在今天的真实工程场景中，一次智能体任务 95% 以上的 Token 消耗都在反复吞吐长上下文（Prefill 与 KV 缓存命中），只有不到 5% 是在生成最终补丁（Decode）。只有真正看懂了张量如何穿过模型、KV Cache 缓存了什么，你才能在写应用时设计出高命中率的上下文结构，在调系统时看懂最前沿模型的架构取舍。
+### 3. 第十节演进：MLA + CSA2 + FP4 极低显存 KV Cache
+
+为支撑 100 万 Token 上下文，模型结合了三项缓存压缩技术：**MLA（多头潜在注意力）** 将键值张量压入低维潜在向量（单独分离 `qk_rope_head_dim = 64` 施加旋转编码）；**CSA2（第二代压缩稀疏注意力）** 按 `Full / Reindex / Reuse` 跨层复用稀疏 Top-K 位置索引；配合 **FP4（E2M1）缓存量化**，将单 Token 的全模型 KV Cache 压缩至 **890 字节**。
+
+### 4. 阶段 11 演进：DSpark 投机解码与 1017 强化学习精简
+
+为打破阶段 11 单步串行吐词的延迟瓶颈，模型引入 **DSpark 半自回归投机解码**，单次预测多个后续 Token 并并行验真；同时 `1017` 版本通过自反馈强化学习（RL）精简了冗余的中间思维链，以更少的解码步数完成工程交付。
 
 ---
 
-## 十二、 结语
+## 十二、 结语与机械可解释性边界
 
-现在，让我们合上代码，回到出发前立下的那条自我检验标准：**给我任意一个关键张量，我能说出它的各个维度代表什么、从哪里来、经过哪个参数矩阵、下一步去哪里；并能指出哪些是权重，哪些是本次输入产生的激活。**
+至此，看到任意一个张量形状，你都可以立即定位它在计算图中的坐标：
 
-你可以随时在脑海里抽查自己：
+- 看到 `[1, 3, 10, 64]`：带有 $B=1, T=10$，属于**动态中间激活**（或 KV Cache），代表 3 个 GQA 键值头、单头 64 维；
+- 看到 `[1536, 576]`：不含 $B$ 与 $T$，属于 `.safetensors` 中的**静态参数矩阵**（SwiGLU 的 `gate_proj` 或 `up_proj` 权重）。
 
-- 当你看到一个形状为 `[1, 3, 10, 64]` 的张量，你能立刻反应过来：这是批大小 $B=1$、序列长度 $T=10$ 下产生的**动态中间激活**；中间那个 `3` 代表 GQA 的键值头数 $h_{kv}=3$，末尾的 `64` 是单头维度 $d_h$；它刚刚由 `[1, 10, 576]` 的隐藏状态乘上静态参数矩阵 $\mathbf{W}_K: [192, 576]$ 并经过拆头转置得到；下一步它将被存入本层的 KV Cache，并通过 3 倍广播对齐到 `[1, 9, 10, 64]` 去和 $\mathbf{Q}$ 做点积。
-- 当你看到一个形状为 `[1536, 576]` 的张量，你一眼就能断定：里面既没有 $B$ 也没有 $T$，这是一张存储在 `.safetensors` 里的**静态参数矩阵**（SwiGLU MLP 的门控或升维权重），它在整个推理过程中只读不改。
+但在掌握张量流转之后，我们还需明确一条科学认知边界：**看清每一个张量的维度与数值来路，不等于直接读懂了模型的内部语义。**
 
-一旦建立了这套清晰的张量坐标系，大模型就不再是一团玄学迷雾，而是一台精密、诚实、每一步维度都严丝合缝的线性代数机器。
+在**机械可解释性（Mechanistic Interpretability）**研究中，三项基础定理揭示了为何不能靠肉眼将单个浮点数或注意力分数直接等同于人类概念：
 
-但在本篇的最后，我们必须同时划下一条同样重要的科学认知边界：**能追踪每一个张量的维度与数值来路，不等于我们已经读懂了模型在“想”什么。**
+### 1. 残差流的“无特权基（No Privileged Basis）”
 
-当你在终端日志里看到第 0 层隐藏状态切片里的那个 `-0.0255`、或者看到某个注意力头给前一个词分配了 `0.80` 的权重时，请克制住直接把那个数字解释成“这个神经元代表某个概念”或“模型认为这个词最重要”的冲动。在**机械可解释性（Mechanistic Interpretability，专门研究神经网络内部权重与激活如何涌现出算法机制的学科）**中，三项核心理论严格证明了为什么不能对单个激活数值望文生义：
+如果向量空间的各个坐标轴天然具有特殊地位，使模型倾向于将独立特征对齐到单个坐标轴下标上，这组坐标基就称为**特权基（Privileged Basis）**。
 
-1. **残差流的“无特权基（No Privileged Basis）”与子空间带宽复用**：
-   什么是**特权基（Privileged Basis）**？如果一个向量空间的各个坐标轴天然具有特殊地位（例如因为某个算子只针对单个坐标轴独立施加非线性变换），导致模型倾向于把独立特征对齐到单个坐标轴下标上，这组坐标基就称为“特权基”。
-   然而，正如 Elhage 等人（2021）在 *A Mathematical Framework for Transformer Circuits* 中所指出的，残差流 `[B, T, d]` 是所有层组件共享的一条**纯线性通信总线**——各层的注意力头和 MLP 都是通过线性矩阵乘法从残差流读取信息，再将输出通过线性加法写回残差流。
-   根据我们在前置篇第三节严格证明过的**正交基变换不变性（$(\mathbf{x}\mathbf{R})(\mathbf{R}^\top\mathbf{W}) = \mathbf{x}\mathbf{W}$）**，如果我们对残差流施加任意正交旋转矩阵 $\mathbf{R}$，同时对所有读写权重矩阵施加逆旋转 $\mathbf{R}^\top$，残差流在每个坐标轴下标上的数字会全部改变，但整座模型的计算结果却分毫不差（注：实际模型中的 RMSNorm 仅依赖向量总模长 $\|\mathbf{x}\|$，而正交旋转同样保持模长不变）。因此，**残差流不存在特权基**——残差流向量里的第 $k$ 个浮点数下标只是人为坐标系下的一个任意投影分量，模型没有任何代数动机把某个人类概念单独绑定在某一个浮点数下标上，而是以任意旋转方向上的**低维线性子空间（Linear Subspace）**为单位读写信息。
-2. **多义性（Polysemanticity）与叠加态假设（Superposition Hypothesis）**：
-   既然残差流没有特权基，那在带有逐元素 $\operatorname{SiLU}$ 非线性激活函数（从而打破了正交旋转对称性、拥有特权基）的 MLP 隐藏层 $[B, T, d_{ff}]$ 里，单个坐标下标（即单个神经元）总该对应单一的人类概念（即**单义性 Monosemanticity**）了吧？
-   实证研究给出了相反的答案：在真实大模型中，绝大多数 MLP 神经元都表现出强烈的**多义性（Polysemanticity）**——同一个神经元会在完全不相干的语境（如“学术文献引用”、“中文日常寒暄”与“Rust 编译器报错”）下同时强烈激活。
-   为什么会这样？Anthropic（2022）在 *Toy Models of Superposition* 中提出了**叠加态假设（Superposition Hypothesis）**：现实世界中的稀疏语义特征（Sparse Features，即在任意一句话里只有极少数特征同时出现）有成百上千万个，远大于隐藏层维度 $d$。为了在有限的 $d$ 维空间里塞下远超 $d$ 个特征，模型利用了我们在前置篇第二节学过的 **Johnson-Lindenstrauss 引理与高维近似正交性**——在 $d$ 维空间中选出多达 $\exp(c \cdot \epsilon^2 d)$ 个**近似正交（Almost Orthogonal）**的单位方向，将成千上万个稀疏特征线性叠加（Superpose）编码在同一个 $d$ 维空间里。因此，盯着单个坐标轴上的浮点数，就像盯着成千上万个近似正交的高维特征方向在单一坐标轴上投下的重叠阴影。
-3. **注意力权重不等于因果重要性（QK 寻址电路与 OV 搬运电路的分离，以及 Attention Sink 空操作）**：
-   在分析多头注意力时，初学者最容易把形状为 `[B, h, T, T]` 的注意力概率 $\alpha_{i,j}$ 直接等同于“词 $j$ 对词 $i$ 的因果贡献度”。
-   事实上，如果我们把阶段 04 到 06 的矩阵乘法展开，单个注意力头对残差流的写入增量可以精确分解为两条相互独立的矩阵乘积链路（称为**电路 Circuits**）：
-   - **QK 寻址电路（Query-Key Circuit，$\mathbf{W}_Q \mathbf{W}_K^\top$）**：决定注意力分数 $\mathbf{x}_i \mathbf{W}_Q \mathbf{W}_K^\top \mathbf{x}_j^\top$，进而通过 Softmax 生成权重 $\alpha_{i,j}$——它**只负责计算“去哪个位置寻址”**；
-   - **OV 搬运电路（Output-Value Circuit，$\mathbf{W}_V \mathbf{W}_O$）**：决定一旦选中位置 $j$，实际从位置 $j$ 提取并写回残差流的向量内容 $\Delta\mathbf{x}_i = \sum_j \alpha_{i,j} (\mathbf{x}_j \mathbf{W}_V \mathbf{W}_O)$——它**才负责决定“搬运什么内容以及搬运多大幅度”**。
-   Kobayashi 等人（2020）的向量范数分析与 Xiao 等人（2023）关于**注意力汇聚点（Attention Sink）**的研究表明：由于 Softmax 强制要求每一行的概率和必须等于 $1.0$，当某个注意力头在当前句子里没有找到任何需要触发的特征时，QK 电路往往会把接近 `1.0` 的极高注意力权重集中倾倒在句首的起始控制符 `<|im_start|>` 或标点符号上；与此同时，OV 电路在该词元上的映射范数 $\|\mathbf{x}_{\text{sink}} \mathbf{W}_V \mathbf{W}_O\| \approx 0$。两者相乘后，写入残差流的增量几乎为零，从而利用高注意力权重实现了一次**“空操作（No-Op）”**。
+然而，残差流 `[B, T, d]` 是各层组件仅通过线性矩阵乘法读写、通过线性加法叠加的纯线性通信总线（Elhage et al., 2021）。由前置篇证明的**正交基变换不变性** $(\mathbf{x}\mathbf{R})(\mathbf{R}^\top\mathbf{W}) = \mathbf{x}\mathbf{W}$，若将残差流乘任意正交旋转矩阵 $\mathbf{R}$、同时将读写权重乘 $\mathbf{R}^\top$，残差流在单个坐标下标上的数值会全部改变，但全模型输出完全等价。
 
-正因如此，当研究者真正需要从激活张量中严格考证模型的内部语义机制时，绝不会靠肉眼读取单个浮点数，而是依赖一套从**“相关性观测（Observational）”**逐步升级到**“因果干预（Causal Intervention）”**的科学取证工具链：
+因此，**残差流不存在特权基**——第 $k$ 个浮点数下标只是人为坐标系下的任意投影，模型是以任意旋转方向上的**低维线性子空间（Linear Subspace）**为单位编码信息的。
+
+### 2. 多义性（Polysemanticity）与叠加态假设（Superposition）
+
+即便在带有逐元素 $\operatorname{SiLU}$ 非线性激活（从而打破正交旋转对称性、拥有特权基）的 MLP 隐藏层 $[B, T, d_{ff}]$ 中，单个神经元也极少只对应单一概念（**单义性 Monosemanticity**），而是普遍表现出**多义性（Polysemanticity）**——同一个神经元会在完全无关的语境下同时强烈激活。
+
+Anthropic（2022）提出的**叠加态假设（Superposition Hypothesis）**指出：现实世界中的稀疏语义特征数量远大于隐藏维度 $d$。模型利用前置篇介绍的 **Johnson-Lindenstrauss 引理**，在 $d$ 维空间中选出多达 $\exp(c \cdot \epsilon^2 d)$ 个**近似正交（Almost Orthogonal）**的单位方向，将成千上万个稀疏特征线性叠加在同一个 $d$ 维空间中。单个坐标下标上的数值，只是众多高维特征方向在该坐标轴上的重叠投影。
+
+### 3. QK 寻址与 OV 搬运分离及注意力汇聚点（Attention Sink）
+
+形状为 `[B, h, T, T]` 的注意力权重 $\alpha_{i,j}$ 高，并不等于位置 $j$ 对位置 $i$ 的输出贡献大。将阶段 04 — 06 展开，单个注意力头对残差流的写入增量可严格分解为两条独立电路：
+
+- **QK 寻址电路（$\mathbf{W}_Q \mathbf{W}_K^\top$）**：决定注意力分数与 Softmax 权重 $\alpha_{i,j}$，仅负责计算**去哪个位置寻址**；
+- **OV 搬运电路（$\mathbf{W}_V \mathbf{W}_O$）**：决定从位置 $j$ 提取并写回残差流的实际向量 $\Delta\mathbf{x}_i = \sum_j \alpha_{i,j} (\mathbf{x}_j \mathbf{W}_V \mathbf{W}_O)$，负责决定**搬运什么内容及幅度**。
+
+由于 Softmax 强制每行概率和恒为 $1.0$，当某个注意力头在当前语境下无需触发时，QK 电路常将接近 `1.0` 的极高权重倾倒在句首控制符 `<|im_start|>` 上（称为 **Attention Sink 注意力汇聚点**，Xiao et al., 2023），同时 OV 电路令该词元的映射范数 $\|\mathbf{x}_{\text{sink}} \mathbf{W}_V \mathbf{W}_O\| \approx 0$，从而用高注意力权重实现了一次**空操作（No-Op）**。
+
+### 4. 机械可解释性的四级科学取证工具
+
+正因如此，研究者在考证模型内部机制时，依赖以下四级递进的受控实验工具：
 
 | 取证方法 | 核心操作 | 证据层级 | 适用问题 |
 |---|---|---|---|
@@ -1709,13 +1059,11 @@ pub fn run_real_trace(model_dir: &Path, dev: &Device) -> Result<()> {
 | **3. 稀疏自编码器 (SAE)** | 训练宽度 $M \gg d$ 的过完备稀疏字典 | 无监督特征解耦级 | 解开高维叠加态，提取单义特征方向 |
 | **4. 激活修补 (Activation Patching)** | 跨样本移植特定激活并观测输出恢复 | **因果验证黄金标准** | 证明该子空间是决定输出的必要因果机制 |
 
-上面四级取证工具的具体数学操作与方法论边界如下：
+- **对数几率透镜（Logit Lens）**：无需训练外部参数，直接将第 $\ell$ 层残差流投影至词表空间 $[B, T, V]$，观测各层预测倾向的演进；
+- **线性探针（Linear Probing）**：检验特定属性是否在线性子空间中可分，但仅能证明统计相关性，不能证明模型自身在下游使用了该方向；
+- **稀疏自编码器（SAE）**：通过 $\hat{\mathbf{x}} = \sum_{k=1}^M f_k(\mathbf{x})\mathbf{d}_k$（$M \gg d$）逆向解开高维叠加态，还原出高纯度的单义特征方向 $\mathbf{d}_k$；
+- **激活修补（Activation Patching）**：在“干净输入”与“受损输入”之间定点移植特定层或特定子空间的激活，通过反事实干预（Counterfactual Intervention）确立内部电路的因果作用。
 
-- **对数几率透镜（Logit Lens）**：将中间第 $\ell$ 层的残差流激活 $\mathbf{H}^{(\ell)}$ 经过最终归一化后，提前右乘出口处的词表转置矩阵 $\mathbf{W}_{\text{head}}^\top$ 得到 $[B, T, V]$。它无需训练任何外部参数即可直观看到模型在中途倾向于预测哪个词，但只能观测到已提前对齐到最终输出词表子空间的分量。
-- **线性探针（Linear Probing）**：冻结模型全部权重，在中间层激活 $\mathbf{H}^{(\ell)}: [B, T, d]$ 上训练一个轻量外部线性分类器 $\mathbf{y} = \operatorname{softmax}(\mathbf{H}^{(\ell)}\mathbf{W}_{\text{probe}})$。需要注意，“能被外部探针从激活中读出”仅证明信息存在统计相关性，**不等于**模型自身在后续层实际使用了该信息。
-- **稀疏自编码器（Sparse Autoencoder, SAE）**：在残差流或 MLP 激活旁路训练一个隐藏层宽度 $M \gg d$（如 $M = 16 d$）的**过完备稀疏字典网络** $\hat{\mathbf{x}} = \sum_{k=1}^M f_k(\mathbf{x})\mathbf{d}_k$，强制每次仅有极少数特征 $f_k > 0$。它能逆向解开高维叠加态（Superposition），将混杂多义的 $d$ 维稠密激活拆解回成千上万个高纯度的**单义特征方向（Monosemantic Feature Directions）** $\mathbf{d}_k$。
-- **激活修补（Activation Patching / Causal Tracing）**：构造一对仅在关键概念上有差异的“干净输入 $x_{\text{clean}}$”与“受损输入 $x_{\text{corrupted}}$”；在推理受损输入时，将第 $\ell$ 层位置 $t$ 的激活（或特定 SAE 特征方向）强行覆写（Patch）为干净输入的激活，观测输出 Logits 是否恢复。通过这种受控反事实干预（Counterfactual Intervention），才能真正确立某个内部算法电路（如归纳头 Induction Heads）的因果地位。
+---
 
-**张量的维度与前向计算机制是我们在代码里百分之百确定的工程与数学事实；而内部激活的语义解释则是需要受控实验支撑的科学假说。**
-
-至此，我们已经完整回答了开篇提出的问题：看清了硬盘里那 272 个静态参数矩阵是如何排布的，也亲手追踪了一句输入文本从 `[B, T]` 的整数序列涌入、穿过三十层注意力与门控网络、直到变成下一个输出词的全过程。不过，在那道大门开启之前，我们日常敲下的汉字、英文与代码符号，究竟是按什么算法被切碎成那串 `[B, T]` 整数的？在下一篇（**《第 1 篇｜深入 Tokenizer》**）里，我们将回到阶段 01 的零号站台，亲手拆开这台切词机器。
+至此，我们已经看清了硬盘里 272 个静态权重张量的排布，并亲手追踪了一句文本从 `[B, T]` 整数序列涌入、穿过 30 层 Transformer 直至生成下一个 Token 的全部细节。在下一篇（**《第 1 篇｜深入 Tokenizer》**）中，我们将回到阶段 01 的起点，亲手实现把文本切分为 `[B, T]` 整数序列的分词器。
