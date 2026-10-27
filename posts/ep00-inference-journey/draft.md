@@ -22,14 +22,14 @@
 
 大模型推理涉及高频分词、几十 GB 权重的零拷贝内存映射（`mmap`）以及高并发流式调度。
 
-Python 受限于解释器开销与全局解释器锁（GIL）；C/C++ 则容易引入内存越界与多线程数据竞争。Rust 通过编译期**所有权（Ownership）**与**借用检查（Borrow Checker）**，在不依赖垃圾回收（GC）的前提下，从编译阶段消除了内存与并发安全隐患。
+Python 受限于解释器开销与全局解释器锁（GIL）；C/C++ 则容易引入内存越界与多线程数据竞争。Rust 通过编译期**所有权**（Ownership）与**借用检查**（Borrow Checker），在不依赖垃圾回收（GC）的前提下，从编译阶段消除了内存与并发安全隐患。
 
 ### 2. 基于 LLVM 的原生跨平台编译
 
 Rust 无需像 Python 或 Java 那样在目标机器上配置庞大的解释器或虚拟环境，其跨平台能力建立在三层编译器机制之上：
 
-- **LLVM 中间表示（LLVM IR）**：编译器前端 `rustc` 先将源码转化为硬件无关的 LLVM IR，再由 LLVM 后端直接针对 Apple Silicon（`aarch64`）、x86_64 或 WebAssembly（`wasm32`）生成原生机器码。
-- **编译期条件编译（`#[cfg(...)]`）**：可在编译阶段按操作系统自动挂载硬件加速库（如 macOS 自动链接 `Accelerate` 矩阵框架，Linux/Windows 自动切换通用 CPU 或 CUDA 算子）。
+- **LLVM 中间表示**（LLVM IR）：编译器前端 `rustc` 先将源码转化为硬件无关的 LLVM IR，再由 LLVM 后端直接针对 Apple Silicon（`aarch64`）、x86_64 或 WebAssembly（`wasm32`）生成原生机器码。
+- **编译期条件编译**（`#[cfg(...)]`）：可在编译阶段按操作系统自动挂载硬件加速库（如 macOS 自动链接 `Accelerate` 矩阵框架，Linux/Windows 自动切换通用 CPU 或 CUDA 算子）。
 - **静态链接单文件分发**：所有依赖默认静态编译为单一原生可执行文件，彻底告别动态库缺失与环境冲突。
 
 ---
@@ -66,7 +66,7 @@ Hugging Face（[huggingface.co](https://huggingface.co)）是开源模型权重�
 
 #### （1）config.json：架构超参数
 
-`config.json` 以纯文本记录了决定网络拓扑与张量形状的全部**架构超参数（Architectural Hyperparameters）**：
+`config.json` 以纯文本记录了决定网络拓扑与张量形状的全部**架构超参数**（Architectural Hyperparameters）：
 
 ```json
 {
@@ -106,12 +106,12 @@ Hugging Face（[huggingface.co](https://huggingface.co)）是开源模型权重�
 
 围绕 `"hidden_size": 576`，有两个关键设计逻辑：
 
-- **分布式表示（Distributed Representation）**：离散的整数词号无法直接求导或表达语义距离；将每个词映射为 576 维连续实数向量后，神经网络即可通过线性代数运算度量词法、句法与语境特征。
+- **分布式表示**（Distributed Representation）：离散的整数词号无法直接求导或表达语义距离；将每个词映射为 576 维连续实数向量后，神经网络即可通过线性代数运算度量词法、句法与语境特征。
 - **硬件寄存器对齐**：576 在注意力层被均分为 $h_q = 9$ 个头，单头维度 $d_h = 576 \div 9 = 64$。现代 CPU SIMD 与 GPU Tensor Core 在维度为 $32, 64, 128$ 等 **$2$ 的整数次幂**时计算吞吐率最高。
 
 #### （2）tokenizer.json：子词分词器与词表
 
-为什么输入文本要先做**子词分词（Subword Tokenization）**？
+为什么输入文本要先做**子词分词**（Subword Tokenization）？
 
 若按整句编号，人类句子无穷无尽，词表无法穷举；若按单字符切分，不仅单字符缺乏独立语义，还会使序列长度 $T$ 暴涨，导致复杂度为 $O(T^2)$ 的注意力计算崩溃。
 
@@ -143,12 +143,12 @@ Hugging Face（[huggingface.co](https://huggingface.co)）是开源模型权重�
 
 `model.safetensors` 存储了模型全部 **272 个静态参数张量**（共 `134,515,008` 个参数）：
 
-- **BF16 浮点格式**：每个参数采用 2 字节的 **BF16（Brain Floating Point 16）** 存储（1 位符号 + 8 位指数 + 7 位尾数），保留了与 32 位浮点数（FP32）相同的动态范围以防矩阵连乘溢出，同时将文件体积压缩至 $134,515,008 \times 2\text{ Bytes} \approx \mathbf{269.03\text{ MB}}$。
-- **参数的来源与生命周期**：所有权重在预训练之初均由标准差为 $1/\sqrt{d} \approx 0.04167$ 的正态分布随机初始化；在预训练阶段通过预测下一词的交叉熵损失与**反向传播（Backpropagation）**迭代更新；而在我们今天运行的**推理阶段**，全部 272 个张量永久冻结、只读不改。
+- **BF16 浮点格式**：每个参数采用 2 字节的 **BF16**（Brain Floating Point 16） 存储（1 位符号 + 8 位指数 + 7 位尾数），保留了与 32 位浮点数（FP32）相同的动态范围以防矩阵连乘溢出，同时将文件体积压缩至 $134,515,008 \times 2\text{ Bytes} \approx \mathbf{269.03\text{ MB}}$。
+- **参数的来源与生命周期**：所有权重在预训练之初均由标准差为 $1/\sqrt{d} \approx 0.04167$ 的正态分布随机初始化；在预训练阶段通过预测下一词的交叉熵损失与**反向传播**（Backpropagation）迭代更新；而在我们今天运行的**推理阶段**，全部 272 个张量永久冻结、只读不改。
 
 > **为什么不用下载仓库里的其他文件？**
 > - `tokenizer_config.json` / `special_tokens_map.json`：特殊控制词元 ID 已内嵌于 `tokenizer.json` 中，本篇直接在代码中明文书写 ChatML 模板字符串以保持白盒透明；
-> - `generation_config.json`：记录随机采样的 `temperature` 与 `top_p` 参数；本篇采用 100% 确定性的**贪心解码（Greedy Decoding）**以确保跨平台数值完全可复现；
+> - `generation_config.json`：记录随机采样的 `temperature` 与 `top_p` 参数；本篇采用 100% 确定性的**贪心解码**（Greedy Decoding）以确保跨平台数值完全可复现；
 > - `vocab.json` / `merges.txt`：旧版 Python 分词器的拆分文件，数据已完全包含在 `tokenizer.json` 内。
 
 ### 3. 克隆仓库并下载模型
@@ -259,7 +259,7 @@ Total Tensors: 272 | Total Parameters: 134515008 (~134.52M) | BF16 Disk Footprin
 
 30 层 Transformer（`model.layers.0` 至 `model.layers.29`）的内部结构与形状 100% 相同，每一层固定由 **9 个张量**（约 354 万参数）串联组成：
 
-**（1）自注意力子层（`self_attn`，占 5 个张量，共 88.5 万参数）**
+#### （1）自注意力子层（`self_attn`，占 5 个张量，共 88.5 万参数）
 
 负责跨序列位置检索并聚合上下文信息：
 
@@ -268,7 +268,7 @@ Total Tensors: 272 | Total Parameters: 134515008 (~134.52M) | BF16 Disk Footprin
 - `k_proj.weight` 与 `v_proj.weight`（均为 `[192, 576]`）：将输入投影为 $h_{kv} = 3$ 个键值头（$3 \times 64 = 192$）；
 - `o_proj.weight`（`[576, 576]`）：将多头注意力输出重新融合回 576 维残差流。
 
-**（2）前馈网络子层（`mlp`，占 4 个张量，共 265.4 万参数）**
+#### （2）前馈网络子层（`mlp`，占 4 个张量，共 265.4 万参数）
 
 负责单位置内部的非线性特征变换与知识提取（占单层参数量的 **75%**，是注意力层的 3 倍）：
 
@@ -276,7 +276,7 @@ Total Tensors: 272 | Total Parameters: 134515008 (~134.52M) | BF16 Disk Footprin
 - `gate_proj.weight` 与 `up_proj.weight`（均为 `[1536, 576]`）：将 576 维向量双路升维至 $d_{ff} = 1536$ 维；
 - `down_proj.weight`（`[576, 1536]`）：将门控调制后的 1536 维特征投影回 576 维残差流。
 
-> **核心结论**：在计算机磁盘中，大语言模型既没有 `if-else` 逻辑规则，也没有压缩文本库；它的本体就是一个包含 **272 个命名浮点数数组（共计 1.345 亿个小数）** 的静态数据字典。
+> **核心结论**：在计算机磁盘中，大语言模型既没有 `if-else` 逻辑规则，也没有压缩文本库；它的本体就是一个包含 **272 个命名浮点数数组**（共计 1.345 亿个小数） 的静态数据字典。
 
 ---
 
@@ -284,8 +284,8 @@ Total Tensors: 272 | Total Parameters: 134515008 (~134.52M) | BF16 Disk Footprin
 
 当模型执行前向计算（Forward Pass）时，内存中的所有张量严格分为两类：
 
-1. **参数矩阵（Parameter Matrices / Weights）**：从 `.safetensors` 加载，训练期定型，推理期全程**只读不变**。
-2. **中间激活（Intermediate Activations）**：随当前输入文本动态计算生成，推理结束后（除 KV Cache 外）立即释放。
+1. **参数矩阵**（Parameter Matrices / Weights）：从 `.safetensors` 加载，训练期定型，推理期全程**只读不变**。
+2. **中间激活**（Intermediate Activations）：随当前输入文本动态计算生成，推理结束后（除 KV Cache 外）立即释放。
 
 区分两者的唯一标准是**维度签名**。设批大小为 $B$、序列长度为 $T$、隐藏维度为 $d$、头数为 $h$、单头维度为 $d_h$、词表大小为 $V$：
 
@@ -297,13 +297,13 @@ Total Tensors: 272 | Total Parameters: 134515008 (~134.52M) | BF16 Disk Footprin
 |---|---|---|---|
 | **01. 输入与分词** | 文本 $\to [B, T]$ | 词表（`tokenizer.json`） | `input_ids`: $[B, T]$ |
 | **02. Embedding 查表** | $[B, T] \to [B, T, d]$ | $\mathbf{W}_E: [V, d]$ | $\mathbf{H}^{(0)}: [B, T, d]$ |
-| **03. 位置编码（RoPE）** | 保持 $[B, h, T, d_h]$ | 预计算频率表 $[T_{\max}, d_h/2]$ | $\mathbf{Q}_{\text{rope}}, \mathbf{K}_{\text{rope}}: [B, h, T, d_h]$ |
+| **03. 位置编码**（RoPE） | 保持 $[B, h, T, d_h]$ | 预计算频率表 $[T_{\max}, d_h/2]$ | $\mathbf{Q}_{\text{rope}}, \mathbf{K}_{\text{rope}}: [B, h, T, d_h]$ |
 | **04. QKV 投影与拆头** | $[B, T, d] \to [B, h, T, d_h]$ | $\mathbf{W}_Q, \mathbf{W}_K, \mathbf{W}_V$ | $\mathbf{Q}, \mathbf{K}, \mathbf{V}: [B, h, T, d_h]$ |
 | **05. 注意力与掩码** | $[B, h, T, d_h] \to [B, h, T, T] \to [B, h, T, d_h]$ | 无（缩放常数与因果掩码） | $\mathbf{S}, \mathbf{A}: [B, h, T, T]$，$\mathbf{O}_h: [B, h, T, d_h]$ |
 | **06. 多头合并与投影** | $[B, h, T, d_h] \to [B, T, d]$ | $\mathbf{W}_O: [d, d]$ | $\mathbf{O}_{\text{concat}}, \Delta\mathbf{H}_{\text{attn}}: [B, T, d]$ |
 | **07. 归一化、残差与 MLP** | $[B, T, d] \to [B, T, d_{ff}] \to [B, T, d]$ | $\boldsymbol{\gamma}: [d]$，$\mathbf{W}_{\text{gate}}, \mathbf{W}_{\text{up}}, \mathbf{W}_{\text{down}}$ | $\mathbf{G}, \mathbf{U}: [B, T, d_{ff}]$，$\mathbf{H}^{(1)}: [B, T, d]$ |
 | **08. 串联多层 Transformer** | $\mathbf{H}^{(0)} \to \dots \to \mathbf{H}^{(L)}: [B, T, d]$ | 第 $0 \dots L-1$ 层权重组 | $\mathbf{H}^{(\ell)}: [B, T, d]$ |
-| **09. 输出投影（LM Head）** | $[B, T, d] \to [B, T, V]$ | $\mathbf{W}_{\text{head}}: [V, d]$ | $\text{logits}_{\text{all}}: [B, T, V]$ |
+| **09. 输出投影**（LM Head） | $[B, T, d] \to [B, T, V]$ | $\mathbf{W}_{\text{head}}: [V, d]$ | $\text{logits}_{\text{all}}: [B, T, V]$ |
 | **10. 选出下一个 Token** | $[B, T, V] \to [B, V] \to [B, 1]$ | 无参数矩阵 | $\text{logits}_{\text{last}}: [B, V]$ |
 | **11. 自回归生成循环** | 追加新词，步进循环 | 全模型权重复用 | 新增激活与 **KV Cache** |
 
@@ -343,11 +343,11 @@ $$
 \text{input\_ids}: [B, T] \xrightarrow{\text{按行查表 } \mathbf{W}_E: [V, d]} \mathbf{H}^{(0)}: [B, T, d]
 $$
 
-查表所得的 $\mathbf{H}^{(0)}$ 即第 0 层初始**隐藏状态（Hidden States）**，也称为**残差流（Residual Stream）**——在后续 30 层网络中，主干张量始终保持 $[B, T, d]$ 形状，各层子模块的输出均通过逐元素加法叠加其上。
+查表所得的 $\mathbf{H}^{(0)}$ 即第 0 层初始**隐藏状态**（Hidden States），也称为**残差流**（Residual Stream）——在后续 30 层网络中，主干张量始终保持 $[B, T, d]$ 形状，各层子模块的输出均通过逐元素加法叠加其上。
 
 ### 03. 旋转位置编码（RoPE）
 
-矩阵乘法本身对行顺序不敏感（调换输入词序只会调换输出行序）。为注入序列位置 $t \in \{0, \dots, T-1\}$，现代开源模型普遍采用**旋转位置编码（Rotary Position Embedding, RoPE）**：
+矩阵乘法本身对行顺序不敏感（调换输入词序只会调换输出行序）。为注入序列位置 $t \in \{0, \dots, T-1\}$，现代开源模型普遍采用**旋转位置编码**（Rotary Position Embedding, RoPE）：
 
 1. **子空间配对**：在阶段 04 拆出单头维度 $d_h = 64$ 的查询向量 $\mathbf{Q}$ 与键向量 $\mathbf{K}$（形状 $[B, h, T, 64]$）后，将 64 个维度按半区配对为 **32 组二维向量** $[x_i, x_{i+32}]$（$i = 0 \dots 31$），并按几何级数分配基频 $\omega_i = 1 / 100000^{2i/64}$。
 2. **正交旋转**：对序列位置 $t$ 的词元，使用二维正交旋转矩阵 $\mathbf{R}(t\omega_i)$ 将第 $i$ 组二维子空间旋转 $t\omega_i$ 弧度。
@@ -357,7 +357,7 @@ $$
 
 ## 五、 注意力机制（阶段 04 — 06）
 
-在初始隐藏状态 $\mathbf{H}^{(0)}$ 中，每一行仅包含当前词自身的字面特征。**多头自注意力（Multi-Head Self-Attention）** 的作用是让每个位置根据特征匹配度，动态检索并加权融合前文所有位置的信息。
+在初始隐藏状态 $\mathbf{H}^{(0)}$ 中，每一行仅包含当前词自身的字面特征。**多头自注意力**（Multi-Head Self-Attention） 的作用是让每个位置根据特征匹配度，动态检索并加权融合前文所有位置的信息。
 
 ```mermaid
 flowchart TD
@@ -404,9 +404,9 @@ flowchart TD
 
 为实现非对称的上下文检索，模型先用三张参数矩阵 $\mathbf{W}_Q, \mathbf{W}_K, \mathbf{W}_V$ 将输入隐藏状态 $\mathbf{H}$ 投影为三份角色：
 
-- **查询（Query, $\mathbf{Q}$）**：当前位置发出的检索特征向量；
-- **键（Key, $\mathbf{K}$）**：各位置供检索匹配的特征索引向量；
-- **值（Value, $\mathbf{V}$）**：配对成功后实际被提取搬运的内容向量。
+- **查询**（Query, $\mathbf{Q}$）：当前位置发出的检索特征向量；
+- **键**（Key, $\mathbf{K}$）：各位置供检索匹配的特征索引向量；
+- **值**（Value, $\mathbf{V}$）：配对成功后实际被提取搬运的内容向量。
 
 $$
 \mathbf{Q}_{\text{raw}} = \mathbf{H}\mathbf{W}_Q^\top, \quad \mathbf{K}_{\text{raw}} = \mathbf{H}\mathbf{W}_K^\top, \quad \mathbf{V}_{\text{raw}} = \mathbf{H}\mathbf{W}_V^\top
@@ -422,7 +422,7 @@ $$
 [B, T, h \cdot d_h] \xrightarrow{\text{Reshape}} [B, T, h, d_h] \xrightarrow{\text{Transpose}(1,2)} [B, h, T, d_h]
 $$
 
-在 `SmolLM2-135M` 中，查询头有 $h_q = 9$ 个（$\mathbf{Q}$ 形状为 `[B, 9, T, 64]`），而键值头采用**分组查询注意力（Grouped-Query Attention, GQA）**，仅有 $h_{kv} = 3$ 个（$\mathbf{K}, \mathbf{V}$ 形状为 `[B, 3, T, 64]`）。在计算点积前，代码通过 `repeat_kv` 将 3 个键值头各复制 3 份广播为 `[B, 9, T, 64]`，使每 3 个查询头共享 1 组键值头，从而将 KV 缓存显存占用降低三分之二。
+在 `SmolLM2-135M` 中，查询头有 $h_q = 9$ 个（$\mathbf{Q}$ 形状为 `[B, 9, T, 64]`），而键值头采用**分组查询注意力**（Grouped-Query Attention, GQA），仅有 $h_{kv} = 3$ 个（$\mathbf{K}, \mathbf{V}$ 形状为 `[B, 3, T, 64]`）。在计算点积前，代码通过 `repeat_kv` 将 3 个键值头各复制 3 份广播为 `[B, 9, T, 64]`，使每 3 个查询头共享 1 组键值头，从而将 KV 缓存显存占用降低三分之二。
 
 ### 05. 缩放点积注意力与因果掩码
 
@@ -432,9 +432,9 @@ $$
 \mathbf{S} = \frac{\mathbf{Q}\mathbf{K}^\top}{\sqrt{d_h}}, \qquad \text{Shape: } [B, h, T, d_h] \times [B, h, d_h, T] \longrightarrow [B, h, T, T]
 $$
 
-自回归语言模型必须严格遵守**因果律（Causality）**：位置 $i$ 的词元只能看到 $j \le i$ 的历史与当前位置，绝不能偷看 $j > i$ 的未来位置。
+自回归语言模型必须严格遵守**因果律**（Causality）：位置 $i$ 的词元只能看到 $j \le i$ 的历史与当前位置，绝不能偷看 $j > i$ 的未来位置。
 
-模型在分数方阵 $\mathbf{S}$ 上叠加一个上三角全为 $-\infty$、下三角及对角线全为 $0$ 的**因果掩码（Causal Mask）**，再按行执行 $\operatorname{softmax}$ 归一化（上三角经 $e^{-\infty} = 0$ 后权重严格归零），最后左乘值矩阵 $\mathbf{V}$：
+模型在分数方阵 $\mathbf{S}$ 上叠加一个上三角全为 $-\infty$、下三角及对角线全为 $0$ 的**因果掩码**（Causal Mask），再按行执行 $\operatorname{softmax}$ 归一化（上三角经 $e^{-\infty} = 0$ 后权重严格归零），最后左乘值矩阵 $\mathbf{V}$：
 
 $$
 \mathbf{A} = \operatorname{softmax}\left(\frac{\mathbf{Q}\mathbf{K}^\top}{\sqrt{d_h}} + \text{mask}\right) \in \mathbb{R}^{[B, h, T, T]}, \qquad \mathbf{O}_h = \mathbf{A}\mathbf{V} \in \mathbb{R}^{[B, h, T, d_h]}
@@ -548,9 +548,9 @@ $$
 
 对 $\mathbf{S}_{\text{masked}}^{(1)}$ 逐行求 $\operatorname{softmax}$：
 
-- **第 0 行（`"我"`）**：仅第 0 列有效，概率必为 `[1.0, 0.0, 0.0]`；
-- **第 1 行（`"喜欢"`）**：前两列数值相等，概率平分为 `[0.5, 0.5, 0.0]`；
-- **第 2 行（`"写"`）**：三列经指数归一化后约为 `[0.20, 0.40, 0.40]`。
+- **第 0 行**（`"我"`）：仅第 0 列有效，概率必为 `[1.0, 0.0, 0.0]`；
+- **第 1 行**（`"喜欢"`）：前两列数值相等，概率平分为 `[0.5, 0.5, 0.0]`；
+- **第 2 行**（`"写"`）：三列经指数归一化后约为 `[0.20, 0.40, 0.40]`。
 
 用所得权重方阵 $\mathbf{A}^{(1)}$ 左乘 $\mathbf{V}^{(1)}$：
 
@@ -652,7 +652,7 @@ let o_concat = context.transpose(1, 2)?.contiguous()?.reshape((b, t, d))?;
 
 ### 07. 残差连接、RMSNorm 与 SwiGLU MLP
 
-注意力子层算出上下文增量 $\Delta\mathbf{H}_{\text{attn}}$ 后，通过**残差连接（Residual Connection）**直接叠加回输入主干：
+注意力子层算出上下文增量 $\Delta\mathbf{H}_{\text{attn}}$ 后，通过**残差连接**（Residual Connection）直接叠加回输入主干：
 
 $$
 \mathbf{H}_{\text{mid}} = \mathbf{H}^{(0)} + \Delta\mathbf{H}_{\text{attn}}, \qquad \text{Shape: } [B, T, d]
@@ -662,9 +662,9 @@ $$
 
 与跨位置交互的注意力层不同，MLP 仅在每个序列位置 $t$ 自身的向量上独立执行三步非线性变换：
 
-1. **双路升维投影（$576 \to 1536$）**：$\mathbf{X}_{\text{norm}}$ 同时右乘 $\mathbf{W}_{\text{up}}^\top$ 得到候选特征 $\mathbf{U} = \mathbf{X}_{\text{norm}}\mathbf{W}_{\text{up}}^\top$，右乘 $\mathbf{W}_{\text{gate}}^\top$ 并经 $\operatorname{SiLU}(x) = x\sigma(x)$ 激活得到门控张量 $\mathbf{G} = \operatorname{SiLU}(\mathbf{X}_{\text{norm}}\mathbf{W}_{\text{gate}}^\top)$，两者形状均为 $[B, T, 1536]$；
+1. **双路升维投影**（$576 \to 1536$）：$\mathbf{X}_{\text{norm}}$ 同时右乘 $\mathbf{W}_{\text{up}}^\top$ 得到候选特征 $\mathbf{U} = \mathbf{X}_{\text{norm}}\mathbf{W}_{\text{up}}^\top$，右乘 $\mathbf{W}_{\text{gate}}^\top$ 并经 $\operatorname{SiLU}(x) = x\sigma(x)$ 激活得到门控张量 $\mathbf{G} = \operatorname{SiLU}(\mathbf{X}_{\text{norm}}\mathbf{W}_{\text{gate}}^\top)$，两者形状均为 $[B, T, 1536]$；
 2. **Hadamard 逐元素门控**：计算逐元素乘积 $\mathbf{G} \odot \mathbf{U}: [B, T, 1536]$，动态过滤并调制特征分量；
-3. **降维线性投影（$1536 \to 576$）**：右乘 $\mathbf{W}_{\text{down}}^\top$ 还原回 $[B, T, 576]$，并再次与残差流相加：
+3. **降维线性投影**（$1536 \to 576$）：右乘 $\mathbf{W}_{\text{down}}^\top$ 还原回 $[B, T, 576]$，并再次与残差流相加：
 
 $$
 \Delta\mathbf{H}_{\text{mlp}} = \big(\operatorname{SiLU}(\mathbf{X}_{\text{norm}}\mathbf{W}_{\text{gate}}^\top) \odot (\mathbf{X}_{\text{norm}}\mathbf{W}_{\text{up}}^\top)\big)\mathbf{W}_{\text{down}}^\top, \qquad \mathbf{H}^{(1)} = \mathbf{H}_{\text{mid}} + \Delta\mathbf{H}_{\text{mlp}}
@@ -682,15 +682,15 @@ $$
 
 ### 09. 输出投影（LM Head）与权重绑定
 
-为了将 $d = 576$ 维特征向量转化为词表 $V = 49,152$ 个候选词的预测得分，模型将 $\mathbf{H}_{\text{final}}$ 右乘**语言模型输出头（LM Head）**转置矩阵 $\mathbf{W}_{\text{head}}^\top \in \mathbb{R}^{d \times V}$，得到**未归一化对数概率（Logits）**：
+为了将 $d = 576$ 维特征向量转化为词表 $V = 49,152$ 个候选词的预测得分，模型将 $\mathbf{H}_{\text{final}}$ 右乘**语言模型输出头**（LM Head）转置矩阵 $\mathbf{W}_{\text{head}}^\top \in \mathbb{R}^{d \times V}$，得到**未归一化对数概率**（Logits）：
 
 $$
 \text{logits}_{\text{all}} = \mathbf{H}_{\text{final}} \mathbf{W}_{\text{head}}^\top, \qquad \text{Shape: } [B, T, d] \times [d, V] \longrightarrow [B, T, V]
 $$
 
-> **首尾词表权重绑定（Weight Tying）**：
-> - **3B 及以下轻量模型（`tie_word_embeddings: true`）**：如 `SmolLM2-135M`、`Qwen2.5-0.5B`、`Llama-3.2-1B`。由于词表矩阵占比极高（本模型单张表即占总参数的 21.05%），出口处的 $\mathbf{W}_{\text{head}}$ 直接复用阶段 02 入口处的词嵌入矩阵 $\mathbf{W}_E$，因此在 `.safetensors` 中不存在独立的 `lm_head.weight` 键；
-> - **7B 及以上中大型模型（`tie_word_embeddings: false`）**：参数预算充裕，为避免首尾梯度互相干扰并便于跨卡流水线并行，入口 `embed_tokens.weight` 与出口 `lm_head.weight` 解绑为两张独立矩阵。
+> **首尾词表权重绑定**（Weight Tying）：
+> - **3B 及以下轻量模型**（`tie_word_embeddings: true`）：如 `SmolLM2-135M`、`Qwen2.5-0.5B`、`Llama-3.2-1B`。由于词表矩阵占比极高（本模型单张表即占总参数的 21.05%），出口处的 $\mathbf{W}_{\text{head}}$ 直接复用阶段 02 入口处的词嵌入矩阵 $\mathbf{W}_E$，因此在 `.safetensors` 中不存在独立的 `lm_head.weight` 键；
+> - **7B 及以上中大型模型**（`tie_word_embeddings: false`）：参数预算充裕，为避免首尾梯度互相干扰并便于跨卡流水线并行，入口 `embed_tokens.weight` 与出口 `lm_head.weight` 解绑为两张独立矩阵。
 
 ### 10. 选出下一个 Token
 
@@ -873,7 +873,7 @@ pub fn forward_step(
 cargo run -- --mode real
 ```
 
-终端首先打印 **Step 1（Prefill 预填充阶段，输入 10 个 Prompt Token）** 的追踪日志：
+终端首先打印 **Step 1**（Prefill 预填充阶段，输入 10 个 Prompt Token） 的追踪日志：
 
 ```text
 [01.Tokenizer ] Raw prompt: "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
@@ -936,7 +936,7 @@ cargo run -- --mode real
 
 为了计算第 11 个位置的注意力输出，我们只需用**第 11 个位置自身的查询向量 $\mathbf{q}_{11}: [1, 9, 1, 64]$**，与全部 11 个位置的键矩阵 $\mathbf{K}_{1..11}: [1, 3, 11, 64]$ 和值矩阵 $\mathbf{V}_{1..11}: [1, 3, 11, 64]$ 相乘即可。
 
-因此，**KV Cache（键值缓存）** 只需在显存中保存各层历史位置的 $\mathbf{K}_{\text{rope}}$ 与 $\mathbf{V}$ 激活张量，历史位置的 $\mathbf{Q}$ 用完即弃。
+因此，**KV Cache**（键值缓存） 只需在显存中保存各层历史位置的 $\mathbf{K}_{\text{rope}}$ 与 $\mathbf{V}$ 激活张量，历史位置的 $\mathbf{Q}$ 用完即弃。
 
 ### 2. Step 2（Decode 阶段）真机日志
 
@@ -978,8 +978,8 @@ Step 2 选出最高分 Token ID `17`（`"!"`），与 Step 1 的 `"Hello"` 拼�
 | **注意力分数 $\mathbf{Q}_{\text{new}}\mathbf{K}_{\text{all}}^\top$** | **`[1, 9, 10, 10]`**（二维方阵） | **`[1, 9, 1, 11]`**（单行向量） |
 | **MLP 升维 / Logits** | `[1, 10, 1536]` $\to$ `[1, 10, 49152]` | **`[1, 1, 1536]`** $\to$ **`[1, 1, 49152]`** |
 
-- **Prefill（计算受限 Compute-Bound）**：一次性并行处理整句 Prompt，做矩阵乘矩阵运算并填满 KV Cache；
-- **Decode（访存带宽受限 Memory-Bound）**：每步仅输入 1 个新词，线性层与 MLP 的激活退化为单行向量 `[1, 1, d]`，主要耗时花在从显存搬运庞大的权重与历史 KV Cache 上。
+- **Prefill**（计算受限 Compute-Bound）：一次性并行处理整句 Prompt，做矩阵乘矩阵运算并填满 KV Cache；
+- **Decode**（访存带宽受限 Memory-Bound）：每步仅输入 1 个新词，线性层与 MLP 的激活退化为单行向量 `[1, 1, d]`，主要耗时花在从显存搬运庞大的权重与历史 KV Cache 上。
 
 ---
 
@@ -992,7 +992,7 @@ Step 2 选出最高分 Token ID `17`（`"!"`），与 Step 1 的 `"Hello"` 拼�
 | 演进部位 | `SmolLM2-135M`（今日基准） | `DeepSeek-V4.1-Flash-1017`（前沿标杆） | 解决的核心瓶颈 |
 |---|---|---|---|
 | **1. MLP 与知识存储** | 稠密 SwiGLU（100% 激活） | **细粒度 MoE（384 选 6）+ 196B Engram 记忆** | 总容量 552B，单步仅百亿级算力 |
-| **2. 层堆叠与读写分工** | 30 层均质纯 Decoder | **20+20 层非对称 CED（Prefill 8B / Decode 16B）** | 长文预填充算力直接砍半 |
+| **2. 层堆叠与读写分工** | 30 层均质纯 Decoder | **20+20 层非对称 CED**（Prefill 8B / Decode 16B） | 长文预填充算力直接砍半 |
 | **3. 注意力与 KV 缓存** | 标准 GQA（FP16/BF16 缓存） | **MLA 低秩压缩 + CSA2 稀疏 + FP4 量化** | 全局 KV 压至 **890 Bytes/词** |
 | **4. 自回归解码步进** | 单步串行吐 1 词 | **DSpark 投机解码 + `1017` RL 思维链精简** | 一次验真多词，减少总输出步数 |
 
@@ -1006,7 +1006,7 @@ Step 2 选出最高分 Token ID `17`（`"!"`），与 Step 1 的 `"Hello"` 拼�
 
 ### 3. 第十节演进：MLA + CSA2 + FP4 极低显存 KV Cache
 
-为支撑 100 万 Token 上下文，模型结合了三项缓存压缩技术：**MLA（多头潜在注意力）** 将键值张量压入低维潜在向量（单独分离 `qk_rope_head_dim = 64` 施加旋转编码）；**CSA2（第二代压缩稀疏注意力）** 按 `Full / Reindex / Reuse` 跨层复用稀疏 Top-K 位置索引；配合 **FP4（E2M1）缓存量化**，将单 Token 的全模型 KV Cache 压缩至 **890 字节**。
+为支撑 100 万 Token 上下文，模型结合了三项缓存压缩技术：**MLA**（多头潜在注意力） 将键值张量压入低维潜在向量（单独分离 `qk_rope_head_dim = 64` 施加旋转编码）；**CSA2**（第二代压缩稀疏注意力） 按 `Full / Reindex / Reuse` 跨层复用稀疏 Top-K 位置索引；配合 **FP4（E2M1）缓存量化**，将单 Token 的全模型 KV Cache 压缩至 **890 字节**。
 
 ### 4. 阶段 11 演进：DSpark 投机解码与 1017 强化学习精简
 
@@ -1023,30 +1023,30 @@ Step 2 选出最高分 Token ID `17`（`"!"`），与 Step 1 的 `"Hello"` 拼�
 
 但在掌握张量流转之后，我们还需明确一条科学认知边界：**看清每一个张量的维度与数值来路，不等于直接读懂了模型的内部语义。**
 
-在**机械可解释性（Mechanistic Interpretability）**研究中，三项基础定理揭示了为何不能靠肉眼将单个浮点数或注意力分数直接等同于人类概念：
+在**机械可解释性**（Mechanistic Interpretability）研究中，三项基础定理揭示了为何不能靠肉眼将单个浮点数或注意力分数直接等同于人类概念：
 
 ### 1. 残差流的“无特权基（No Privileged Basis）”
 
-如果向量空间的各个坐标轴天然具有特殊地位，使模型倾向于将独立特征对齐到单个坐标轴下标上，这组坐标基就称为**特权基（Privileged Basis）**。
+如果向量空间的各个坐标轴天然具有特殊地位，使模型倾向于将独立特征对齐到单个坐标轴下标上，这组坐标基就称为**特权基**（Privileged Basis）。
 
 然而，残差流 `[B, T, d]` 是各层组件仅通过线性矩阵乘法读写、通过线性加法叠加的纯线性通信总线（Elhage et al., 2021）。由前置篇证明的**正交基变换不变性** $(\mathbf{x}\mathbf{R})(\mathbf{R}^\top\mathbf{W}) = \mathbf{x}\mathbf{W}$，若将残差流乘任意正交旋转矩阵 $\mathbf{R}$、同时将读写权重乘 $\mathbf{R}^\top$，残差流在单个坐标下标上的数值会全部改变，但全模型输出完全等价。
 
-因此，**残差流不存在特权基**——第 $k$ 个浮点数下标只是人为坐标系下的任意投影，模型是以任意旋转方向上的**低维线性子空间（Linear Subspace）**为单位编码信息的。
+因此，**残差流不存在特权基**——第 $k$ 个浮点数下标只是人为坐标系下的任意投影，模型是以任意旋转方向上的**低维线性子空间**（Linear Subspace）为单位编码信息的。
 
 ### 2. 多义性（Polysemanticity）与叠加态假设（Superposition）
 
-即便在带有逐元素 $\operatorname{SiLU}$ 非线性激活（从而打破正交旋转对称性、拥有特权基）的 MLP 隐藏层 $[B, T, d_{ff}]$ 中，单个神经元也极少只对应单一概念（**单义性 Monosemanticity**），而是普遍表现出**多义性（Polysemanticity）**——同一个神经元会在完全无关的语境下同时强烈激活。
+即便在带有逐元素 $\operatorname{SiLU}$ 非线性激活（从而打破正交旋转对称性、拥有特权基）的 MLP 隐藏层 $[B, T, d_{ff}]$ 中，单个神经元也极少只对应单一概念（**单义性 Monosemanticity**），而是普遍表现出**多义性**（Polysemanticity）——同一个神经元会在完全无关的语境下同时强烈激活。
 
-Anthropic（2022）提出的**叠加态假设（Superposition Hypothesis）**指出：现实世界中的稀疏语义特征数量远大于隐藏维度 $d$。模型利用前置篇介绍的 **Johnson-Lindenstrauss 引理**，在 $d$ 维空间中选出多达 $\exp(c \cdot \epsilon^2 d)$ 个**近似正交（Almost Orthogonal）**的单位方向，将成千上万个稀疏特征线性叠加在同一个 $d$ 维空间中。单个坐标下标上的数值，只是众多高维特征方向在该坐标轴上的重叠投影。
+Anthropic（2022）提出的**叠加态假设**（Superposition Hypothesis）指出：现实世界中的稀疏语义特征数量远大于隐藏维度 $d$。模型利用前置篇介绍的 **Johnson-Lindenstrauss 引理**，在 $d$ 维空间中选出多达 $\exp(c \cdot \epsilon^2 d)$ 个**近似正交**（Almost Orthogonal）的单位方向，将成千上万个稀疏特征线性叠加在同一个 $d$ 维空间中。单个坐标下标上的数值，只是众多高维特征方向在该坐标轴上的重叠投影。
 
 ### 3. QK 寻址与 OV 搬运分离及注意力汇聚点（Attention Sink）
 
 形状为 `[B, h, T, T]` 的注意力权重 $\alpha_{i,j}$ 高，并不等于位置 $j$ 对位置 $i$ 的输出贡献大。将阶段 04 — 06 展开，单个注意力头对残差流的写入增量可严格分解为两条独立电路：
 
-- **QK 寻址电路（$\mathbf{W}_Q \mathbf{W}_K^\top$）**：决定注意力分数与 Softmax 权重 $\alpha_{i,j}$，仅负责计算**去哪个位置寻址**；
-- **OV 搬运电路（$\mathbf{W}_V \mathbf{W}_O$）**：决定从位置 $j$ 提取并写回残差流的实际向量 $\Delta\mathbf{x}_i = \sum_j \alpha_{i,j} (\mathbf{x}_j \mathbf{W}_V \mathbf{W}_O)$，负责决定**搬运什么内容及幅度**。
+- **QK 寻址电路**（$\mathbf{W}_Q \mathbf{W}_K^\top$）：决定注意力分数与 Softmax 权重 $\alpha_{i,j}$，仅负责计算**去哪个位置寻址**；
+- **OV 搬运电路**（$\mathbf{W}_V \mathbf{W}_O$）：决定从位置 $j$ 提取并写回残差流的实际向量 $\Delta\mathbf{x}_i = \sum_j \alpha_{i,j} (\mathbf{x}_j \mathbf{W}_V \mathbf{W}_O)$，负责决定**搬运什么内容及幅度**。
 
-由于 Softmax 强制每行概率和恒为 $1.0$，当某个注意力头在当前语境下无需触发时，QK 电路常将接近 `1.0` 的极高权重倾倒在句首控制符 `<|im_start|>` 上（称为 **Attention Sink 注意力汇聚点**，Xiao et al., 2023），同时 OV 电路令该词元的映射范数 $\|\mathbf{x}_{\text{sink}} \mathbf{W}_V \mathbf{W}_O\| \approx 0$，从而用高注意力权重实现了一次**空操作（No-Op）**。
+由于 Softmax 强制每行概率和恒为 $1.0$，当某个注意力头在当前语境下无需触发时，QK 电路常将接近 `1.0` 的极高权重倾倒在句首控制符 `<|im_start|>` 上（称为 **Attention Sink 注意力汇聚点**，Xiao et al., 2023），同时 OV 电路令该词元的映射范数 $\|\mathbf{x}_{\text{sink}} \mathbf{W}_V \mathbf{W}_O\| \approx 0$，从而用高注意力权重实现了一次**空操作**（No-Op）。
 
 ### 4. 机械可解释性的四级科学取证工具
 
@@ -1059,11 +1059,11 @@ Anthropic（2022）提出的**叠加态假设（Superposition Hypothesis）**指
 | **3. 稀疏自编码器 (SAE)** | 训练宽度 $M \gg d$ 的过完备稀疏字典 | 无监督特征解耦级 | 解开高维叠加态，提取单义特征方向 |
 | **4. 激活修补 (Activation Patching)** | 跨样本移植特定激活并观测输出恢复 | **因果验证黄金标准** | 证明该子空间是决定输出的必要因果机制 |
 
-- **对数几率透镜（Logit Lens）**：无需训练外部参数，直接将第 $\ell$ 层残差流投影至词表空间 $[B, T, V]$，观测各层预测倾向的演进；
-- **线性探针（Linear Probing）**：检验特定属性是否在线性子空间中可分，但仅能证明统计相关性，不能证明模型自身在下游使用了该方向；
-- **稀疏自编码器（SAE）**：通过 $\hat{\mathbf{x}} = \sum_{k=1}^M f_k(\mathbf{x})\mathbf{d}_k$（$M \gg d$）逆向解开高维叠加态，还原出高纯度的单义特征方向 $\mathbf{d}_k$；
-- **激活修补（Activation Patching）**：在“干净输入”与“受损输入”之间定点移植特定层或特定子空间的激活，通过反事实干预（Counterfactual Intervention）确立内部电路的因果作用。
+- **对数几率透镜**（Logit Lens）：无需训练外部参数，直接将第 $\ell$ 层残差流投影至词表空间 $[B, T, V]$，观测各层预测倾向的演进；
+- **线性探针**（Linear Probing）：检验特定属性是否在线性子空间中可分，但仅能证明统计相关性，不能证明模型自身在下游使用了该方向；
+- **稀疏自编码器**（SAE）：通过 $\hat{\mathbf{x}} = \sum_{k=1}^M f_k(\mathbf{x})\mathbf{d}_k$（$M \gg d$）逆向解开高维叠加态，还原出高纯度的单义特征方向 $\mathbf{d}_k$；
+- **激活修补**（Activation Patching）：在“干净输入”与“受损输入”之间定点移植特定层或特定子空间的激活，通过反事实干预（Counterfactual Intervention）确立内部电路的因果作用。
 
 ---
 
-至此，我们已经看清了硬盘里 272 个静态权重张量的排布，并亲手追踪了一句文本从 `[B, T]` 整数序列涌入、穿过 30 层 Transformer 直至生成下一个 Token 的全部细节。在下一篇（**《第 1 篇｜深入 Tokenizer》**）中，我们将回到阶段 01 的起点，亲手实现把文本切分为 `[B, T]` 整数序列的分词器。
+至此，我们已经看清了硬盘里 272 个静态权重张量的排布，并亲手追踪了一句文本从 `[B, T]` 整数序列涌入、穿过 30 层 Transformer 直至生成下一个 Token 的全部细节。在下一篇《第 1 篇｜深入 Tokenizer》中，我们将回到阶段 01 的起点，亲手实现把文本切分为 `[B, T]` 整数序列的分词器。
