@@ -165,12 +165,14 @@ pub fn run_prelude_sandbox(dev: &Device) -> Result<()> {
     );
     println!("     Flattened physical order: {:?}", contiguous.flatten_all()?.to_vec1::<f32>()?);
 
-    // Step D: Broadcast expand (repeat Group 0 three times along a new axis)
-    let group0 = contiguous.narrow(0, 0, 1)?; // [1, 3, 2]
-    let repeated = group0.unsqueeze(1)?.expand((1, 3, 3, 2))?.reshape((3, 3, 2))?;
+    // Step D: Broadcast expand (repeat each of the 2 groups 3 times -> 6 groups)
+    let repeated = contiguous
+        .unsqueeze(1)?
+        .expand((2, 3, 3, 2))?
+        .reshape((6, 3, 2))?;
     println!(
-        "  5. Broadcast expand: {:?} repeated 3x -> {:?}",
-        group0.dims(),
+        "  5. Broadcast expand: {:?} (2 groups) each repeated 3x -> {:?} (6 groups)",
+        contiguous.dims(),
         repeated.dims()
     );
 
