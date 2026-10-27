@@ -30,13 +30,21 @@ cargo run -- --mode prelude
 
 读懂任何张量的第一步，就是数一数**方括号里有几个数字**：有几个数字，它就是几维（几阶，Rank）张量：
 
-| 维度阶数 (Rank) | 数学名称 | 形状写法示例 | 直观结构理解 | 具体例子 |
-|---|---|---|---|---|
-| **0 维** | **标量 (Scalar)** | `[]` | 单独的一个数字（没有方括号包裹） | `3.14` 或 `42` |
-| **1 维** | **向量 (Vector)** | `[4]` | 一排连续排列的 4 个数字 | `[1.0, 0.0, 1.0, 0.0]` |
-| **2 维** | **矩阵 (Matrix)** | `[5, 4]` | 一张 **5 行、4 列** 的二维表格（共 $5 \times 4 = 20$ 个数） | Excel 表格：行号 `0..4`，列号 `0..3` |
-| **3 维** | **三维张量** | `[1, 3, 4]` | 把 **1 组**、每组 **3 行 4 列** 的二维表格摞在一起 | 1 个批次，包含 3 行，每行 4 个浮点数 |
-| **4 维** | **四维张量** | `[1, 2, 3, 2]` | 外层有 1 个大盒，里面装 2 个中盒，每个中盒里是一张 $3 \times 2$ 的表格 | 元素总数 $= 1 \times 2 \times 3 \times 2 = 12$ 个数 |
+| 阶数 (Rank) | 数学名称 | 形状示例 | 元素总数 |
+|---|---|---|---|
+| **0 阶** | 标量 (Scalar) | `[]` | $1$ 个 |
+| **1 阶** | 向量 (Vector) | `[4]` | $4$ 个 |
+| **2 阶** | 矩阵 (Matrix) | `[5, 4]` | $5 \times 4 = 20$ 个 |
+| **3 阶** | 三阶张量 | `[1, 3, 4]` | $1 \times 3 \times 4 = 12$ 个 |
+| **4 阶** | 四阶张量 | `[1, 2, 3, 2]` | $1 \times 2 \times 3 \times 2 = 12$ 个 |
+
+各阶张量在内存与几何结构上的对应关系如下：
+
+- **0 阶标量 `[]`**：单独的一个浮点数（如 `3.14`），不带任何方括号维度；
+- **1 阶向量 `[4]`**：一排连续排列的 4 个数字（如 `[1.0, 0.0, 1.0, 0.0]`）；
+- **2 阶矩阵 `[5, 4]`**：一张 **5 行、4 列** 的二维表格（行号 `0..4`，列号 `0..3`）；
+- **3 阶张量 `[1, 3, 4]`**：把 **1 组**、每组 **3 行 4 列** 的二维表格摞在一起（常见于 `[Batch, SeqLen, Dim]`）；
+- **4 阶张量 `[1, 2, 3, 2]`**：外层 1 个大盒，内含 2 个中盒，每个中盒里是一张 $3 \times 2$ 的二维表格（常见于多头注意力 `[Batch, Heads, SeqLen, HeadDim]`）。
 
 **读维度的通用口诀：从左往右看，就是从最外层括号往最里层括号一层层剥开；所有维度的数字乘起来，就是张量里包含的数字总个数。**
 
@@ -111,6 +119,21 @@ $$\mathbf{a} \cdot \mathbf{b} = \|\mathbf{a}\| \|\mathbf{b}\| \cos\theta$$
 --- [2/6] Vector Dot Product (a · b) ---
   a [1, 2] · b_list^T [2, 3] -> [1, 3] = [[2.0, 4.0, 0.0]]
 ```
+
+### 3. 高维近似正交与 Johnson-Lindenstrauss 引理
+
+在上面的点积性质中，**正交（Orthogonal，即 $\mathbf{u} \cdot \mathbf{v} = 0$，夹角 $\theta = 90^\circ$）** 具有特殊的代数地位：如果两个单位向量互相正交，它们在彼此方向上的投影严格为 `0`。这意味着你可以把两个独立的信息分别沿着这两个方向存放，读取时用点积检索，两者**完全不会互相干扰**。
+
+那么，在一个 $d$ 维向量空间 $\mathbb{R}^d$ 中，最多能找到多少根**两两严格正交（$\theta = 90^\circ$）**的单位向量？
+线性代数的答案是：**最多只有 $d$ 根**（即该空间的一组标准正交基 Orthonormal Basis：二维平面最多 2 根，三维空间最多 3 根，576 维空间最多 576 根）。
+
+但如果我们在工程中退一步——不要求两两夹角严格等于 $90^\circ$（点积严格为 $0$），而是允许一个极小的点积误差 $\epsilon$（例如夹角落在 $89^\circ \sim 91^\circ$ 之间，满足 $|\mathbf{u}_i \cdot \mathbf{u}_j| \le \epsilon$），我们把它称为**近似正交（Almost Orthogonal / Quasi-Orthogonal）**。此时空间里能塞下多少根近似正交的单位向量？
+
+高维几何中的 **Johnson-Lindenstrauss 引理（约翰逊-林登施特劳斯引理）** 给出了一个反直觉的严格结论：在 $d$ 维空间中，两两满足 $|\mathbf{u}_i \cdot \mathbf{u}_j| \le \epsilon$ 的单位向量最大数量 $M$ 随维度 $d$ 呈**指数级增长**：
+
+$$M \sim \exp(c \cdot \epsilon^2 d)$$
+
+在二维或三维空间里，这个性质并不明显；但当维度 $d$ 达到几百或几千（例如 $d = 576$）时，虽然严格正交的坐标轴依然只有 $576$ 根，空间里却可以同时容纳**成千上万根“近似正交”的特征方向**！这也是高维向量空间能够以极小干扰把远多于维度数 $d$ 的独立特征压缩叠加在一起的数学根源。
 
 ---
 
@@ -264,18 +287,44 @@ pub fn linear_3d(x: &Tensor, w: &Tensor) -> Result<Tensor> {
   2D -> 3D Unflatten y_3d      [2, 2, 2]: [[[6.0, 1.0], [15.0, 4.0]], [[60.0, 10.0], [150.0, 40.0]]]
 ```
 
+### 4. 平面旋转矩阵、正交矩阵与基变换不变性
+
+在所有的方阵中，有一类极其重要的特殊矩阵叫做**正交矩阵（Orthogonal Matrix，通常记作 $\mathbf{R}$）**。
+它的定义是：矩阵的每一行（以及每一列）都是长度为 $1$ 的单位向量，且不同行之间两两正交（点积为 $0$）。因此，把正交矩阵 $\mathbf{R}$ 和它自己的转置 $\mathbf{R}^\top$ 相乘，必然得到对角线全为 $1$、其余位置全为 $0$ 的**单位矩阵（Identity Matrix, $\mathbf{I}$）**：
+
+$$\mathbf{R}\mathbf{R}^\top = \mathbf{R}^\top\mathbf{R} = \mathbf{I} = \begin{bmatrix} 1 & 0 \\ 0 & 1 \end{bmatrix}$$
+
+正交矩阵在几何上代表**刚体旋转（或镜像反射）**——把一个向量乘上正交矩阵 $\mathbf{R}$，只会改变向量的方向，绝不改变向量的长度（$\|\mathbf{x}\mathbf{R}\| = \|\mathbf{x}\|$）。最经典的例子就是**二维平面旋转矩阵** $\mathbf{R}(\theta)$：
+
+$$\mathbf{R}(\theta) = \begin{bmatrix} \cos\theta & -\sin\theta \\ \sin\theta & \cos\theta \end{bmatrix}$$
+
+围绕旋转矩阵与正交矩阵，有两条核心代数性质会在后续文章中直接派上用场：
+
+1. **性质一（相对旋转角的点积保角性）**：
+   因为刚体旋转不会改变两个向量之间的夹角，如果把二维向量 $\mathbf{q}$ 旋转 $m\theta$ 角得到 $\mathbf{q}' = \mathbf{q}\mathbf{R}(m\theta)$，把向量 $\mathbf{k}$ 旋转 $n\theta$ 角得到 $\mathbf{k}' = \mathbf{k}\mathbf{R}(n\theta)$，那么旋转后的两个向量做点积，中间的旋转矩阵会合并为 $\mathbf{R}(m\theta)\mathbf{R}(n\theta)^\top = \mathbf{R}\big((m - n)\theta\big)$。也就是说：**旋转后的点积结果，只取决于两个向量的旋转角度差 $(m - n)\theta$，而与各自的绝对角度 $m, n$ 无关！**
+2. **性质二（正交基变换不变性与“无特权基”）**：
+   考虑一个线性映射 $\mathbf{y} = \mathbf{x}\mathbf{W}$。如果我们任取一个正交旋转矩阵 $\mathbf{R}$，先把行向量 $\mathbf{x}$ 乘以 $\mathbf{R}$ 旋转到一套新的坐标基下：$\mathbf{x}' = \mathbf{x}\mathbf{R}$；同时把后面的权重矩阵 $\mathbf{W}$ 左乘逆旋转矩阵 $\mathbf{R}^\top$：$\mathbf{W}' = \mathbf{R}^\top\mathbf{W}$。
+   由于 $\mathbf{R}\mathbf{R}^\top = \mathbf{I}$ 在中间完美抵消，旋转后的乘积结果为：
+   $$\mathbf{x}'\mathbf{W}' = (\mathbf{x}\mathbf{R})(\mathbf{R}^\top\mathbf{W}) = \mathbf{x}(\mathbf{R}\mathbf{R}^\top)\mathbf{W} = \mathbf{x}\mathbf{I}\mathbf{W} = \mathbf{x}\mathbf{W} = \mathbf{y}$$
+   我们拿一个 $90^\circ$ 正交旋转矩阵 $\mathbf{R} = \begin{bmatrix} 0 & 1 \\ -1 & 0 \end{bmatrix}$（满足 $\mathbf{R}\mathbf{R}^\top = \mathbf{I}$）手算验证：
+   - 设原向量 $\mathbf{x} = [3, 4]$，原矩阵 $\mathbf{W} = \begin{bmatrix} 1 \\ 2 \end{bmatrix}$，原乘积为 $\mathbf{x}\mathbf{W} = 3\times 1 + 4\times 2 = \mathbf{11}$；
+   - 旋转后，向量变成了 $\mathbf{x}' = \mathbf{x}\mathbf{R} = [-4, 3]$（你看，第 0 维和第 1 维的数字全都变了！），同时矩阵变成了 $\mathbf{W}' = \mathbf{R}^\top\mathbf{W} = \begin{bmatrix} 0 & -1 \\ 1 & 0 \end{bmatrix}\begin{bmatrix} 1 \\ 2 \end{bmatrix} = \begin{bmatrix} -2 \\ 1 \end{bmatrix}$；
+   - 再算新乘积：$\mathbf{x}'\mathbf{W}' = (-4)\times(-2) + 3\times 1 = 8 + 3 = \mathbf{11}$，结果分毫不差！
+   这条性质在线性代数中称为**正交基变换不变性（Basis Rotation Invariance）**：在一个纯粹靠矩阵加减与乘法通信的线性向量空间里，**不存在所谓的“特权基（Privileged Basis）”**——向量在某一个特定坐标轴下标（如第 $0$ 维或第 $1$ 维）上的单独数字只是当前坐标系的人为投影，把整套坐标系任意正交旋转一下，单个坐标数字全变了，但系统的全部输入输出功能却完全等价。
+
 ---
 
 ## 四、 矩阵乘法 vs. 逐元素乘法
 
 在公式和代码里，有两种乘法长得很像，但算法完全不同：
 
-| 对比维度 | **矩阵乘法（Matrix Multiplication）** | **逐元素乘法（Element-wise / Hadamard Product）** |
+| 对比项 | 矩阵乘法 (MatMul) | 逐元素乘法 (Hadamard) |
 |---|---|---|
-| **数学符号** | $\mathbf{M}_1 \mathbf{M}_2$ 或 $\mathbf{M}_1 \times \mathbf{M}_2$ | $\mathbf{M}_1 \odot \mathbf{M}_2$（带圈的圆点） |
-| **Rust `candle` 写法** | `m1.matmul(&m2)?` | `(&m1 * &m2)?`（直接使用乘号 `*`） |
-| **形状要求** | 内侧维度相等：`[M, K]` 与 `[K, N]` | **两个张量的形状必须完全相同**：`[M, N]` 与 `[M, N]` |
-| **计算规则** | 第 $i$ 行与第 $j$ 列做向量点积求和，输出 `[M, N]` | **相同位置 `(i, j)` 上的两个数字直接相乘**，输出仍是 `[M, N]` |
+| **数学符号** | $\mathbf{M}_1 \mathbf{M}_2$ | $\mathbf{M}_1 \odot \mathbf{M}_2$ |
+| **`candle` 写法** | `m1.matmul(&m2)?` | `(&m1 * &m2)?` |
+| **输入形状** | `[M, K]` 与 `[K, N]` | `[M, N]` 与 `[M, N]` |
+| **输出形状** | `[M, N]`（消去内侧维度 `K`） | `[M, N]`（形状不变） |
+| **计算规则** | 第 $i$ 行与第 $j$ 列点积求和 | 相同坐标 $(i, j)$ 直接相乘 |
 
 看 `prelude.rs` 里的第四组实验：给定两个相同的 $2 \times 2$ 矩阵 $\mathbf{M}_1$ 和 $\mathbf{M}_2$：
 
@@ -442,9 +491,9 @@ let contiguous = transposed.contiguous()?;
 
 ---
 
-## 六、 均方根归一化与 Softmax
+## 六、 均方根归一化、Softmax 与 SiLU
 
-除了加减乘除，数值计算中还有两个极其常用的归一化函数。我们不背死板公式，而是先搞明白**“为什么要设计它们”**，再用最好算的整数例子一步步验证。
+除了加减乘除，数值计算中还有三个高频函数：**均方根归一化（RMSNorm）**、**Softmax 概率归一化**与 **SiLU 门控激活函数**。我们先把设计它们的数学原因讲透，再用具体数字一步步验证。
 
 ### 1. 均方根归一化（RMSNorm）
 
@@ -564,6 +613,25 @@ $$\sqrt{\frac{0.4^2 + (-0.8)^2 + 0.8^2 + 1.6^2}{4}} = \sqrt{\frac{0.16 + 0.64 + 
 
 ---
 
+### 3. SiLU（Swish）非线性激活函数
+
+为什么在两个矩阵乘法 $\mathbf{x}\mathbf{W}_1$ 和 $\mathbf{W}_2$ 之间，必须插入一个**非线性激活函数（Nonlinear Activation Function）**？
+因为根据矩阵乘法的结合律，如果中间不加非线性函数，连续乘两张矩阵 $\mathbf{x}\mathbf{W}_1\mathbf{W}_2$ 就完全等价于乘一张合并后的矩阵 $\mathbf{x}(\mathbf{W}_1\mathbf{W}_2)$——不管你叠多少层矩阵，整座网络都会坍缩成一个简单的单层线性变换！
+
+为了打破线性坍缩，现代数值网络普遍使用 **SiLU（Sigmoid Linear Unit，又称 Swish）** 逐元素非线性函数。它由两部分相乘构成：
+
+1. 先算 **Sigmoid 逻辑斯谛函数** $\sigma(x) = \frac{1}{1 + e^{-x}}$：它把任意实数 $x \in (-\infty, +\infty)$ 平滑地映射到 **`(0, 1)`** 区间内（当 $x \ll 0$ 时 $\sigma(x) \to 0$ 相当于关闸；当 $x = 0$ 时 $\sigma(0) = 0.5$；当 $x \gg 0$ 时 $\sigma(x) \to 1$ 相当于开闸）；
+2. 再用输入的 $x$ 乘以它自己的 Sigmoid 开关值 $\sigma(x)$：
+   $$\operatorname{SiLU}(x) = x \cdot \sigma(x) = \frac{x}{1 + e^{-x}}$$
+
+手算三个典型点就能看清它的过滤特性：
+- 当输入为负数 $x = -10.0$ 时：$\sigma(-10) \approx 0.000045$，故 $\operatorname{SiLU}(-10.0) \approx \mathbf{-0.00045}$（负值被平滑抑制到接近 $0$）；
+- 当输入为 $x = 0.0$ 时：$\operatorname{SiLU}(0.0) = 0 \times 0.5 = \mathbf{0.0}$；
+- 当输入为正数 $x = 2.0$ 时：$\sigma(2.0) = \frac{1}{1 + e^{-2}} \approx 0.8808$，故 $\operatorname{SiLU}(2.0) = 2.0 \times 0.8808 \approx \mathbf{1.7616}$（正值近似按原比例放行）。
+在代码中，直接调用 `candle_nn::ops::silu(&tensor)?` 即可对张量里的每个元素施加该非线性变换。
+
+---
+
 ## 下半场：Rust 与 candle 极简入门
 
 看完了上半场的 6 条数学法则，下半场我们用最短的时间把后续代码里用到的 **6 个 Rust 编程知识点** 讲清楚。
@@ -607,12 +675,12 @@ sum = sum + 10;  // 合法
 
 在张量与数组代码中，你只会频繁见到以下 4 种基础数值类型：
 
-| Rust 类型名 | 含义 | 常见用途 |
+| 类型 | 位宽与类别 | 典型用途 |
 |---|---|---|
-| **`usize`** | 与当前 CPU 位数一致的无符号整数（64 位机器上为 64 位非负整数） | **数组长度、张量维度大小、循环下标**（如 `rows: usize = 5`） |
-| **`u32`** | 32 位无符号非负整数（范围 `0` 到约 `42 亿`） | 整数索引编号（如行号索引 `&[1u32, 2, 3]`） |
-| **`f32`** | 32 位单精度浮点数 | **张量内部的标准浮点数类型**（如 `1.0f32`） |
-| **`f64`** | 64 位双精度浮点数 | 高精度标量参数或缩放系数（如 `1e-5`） |
+| **`usize`** | 64 位无符号整数（随 CPU 字长） | 数组长度、张量维度、循环下标 |
+| **`u32`** | 32 位无符号整数 | 词表 Token ID、行号索引 |
+| **`f32`** | 32 位单精度浮点数 | 张量内部的标准数值计算 |
+| **`f64`** | 64 位双精度浮点数 | 高精度标量参数（如 `1e-5`） |
 
 需要在不同数值类型之间转换时，Rust 不会隐式转换，而是统一用 **`as` 关键字**显式转换，例如 `(rows as f64).sqrt()`。
 
@@ -850,25 +918,27 @@ let even_floats: Vec<f32> = (0..4).map(|i| (i * 2) as f32).collect();
 
 最后，我们将接下来最常用的 15 个张量操作整理成对照表，方便你在阅读代码时随时查阅：
 
-| 操作功能 | Python (PyTorch / NumPy) | Rust (`candle-core` / `candle-nn`) | 说明 |
-|---|---|---|---|
-| **从数组创建张量** | `torch.tensor(data).reshape(5, 4)` | `Tensor::from_slice(&data, (5, 4), dev)?` | 将一维数组按指定形状加载为张量 |
-| **创建全 0 / 全 1 张量** | `torch.zeros((2, 3))` / `torch.ones((4,))` | `Tensor::zeros((2, 3), DType::F32, dev)?` | 创建指定形状的常数张量 |
-| **查看张量形状** | `x.shape` | `x.dims()` 或 `x.dims3()?` | `dims()` 返回维度数组，`dims3()` 直接解构三维 |
-| **转换数据类型** | `x.to(torch.float32)` | `x.to_dtype(DType::F32)?` | 将 16 位浮点数等转换为 32 位浮点数 `f32` |
-| **按索引号抽行** | `table[row_indices]` | `table.index_select(&row_indices, 0)?` | 沿第 `0` 维（行）抽出指定行号的数据 |
-| **重塑形状 (零拷贝)** | `x.reshape(1, 3, 4)` | `x.reshape((1, 3, 4))?` | 不改变元素总数，仅改变维度划分方式 |
-| **全部展平为一维** | `x.flatten()` | `x.flatten_all()?` | 将任意多维张量展平为一维向量 |
-| **二维转置 (交换最后两维)** | `w.T` | `w.t()?` | 将 `[M, N]` 转置为 `[N, M]` |
-| **交换任意两个维度** | `x.transpose(1, 2)` | `x.transpose(1, 2)?` | 交换第 `1` 维与第 `2` 维 |
-| **整理物理内存连续性** | `x.contiguous()` | `x.contiguous()?` | 将转置后的非连续张量在物理内存中重新排齐 |
-| **矩阵乘法 (MatMul)** | `a @ b` 或 `torch.matmul(a, b)` | `a.matmul(&b)?` | `[M, K] × [K, N] -> [M, N]` |
-| **逐元素加 / 乘** | `a + b` / `a * b` | `(&a + &b)?` / `(&a * &b)?` | 相同形状张量对应位置相加或相乘 |
-| **沿指定维度切取子区间** | `x[offset : offset + len]` | `x.narrow(0, offset, len)?` | 沿第 `0` 维从 `offset` 开始切出长度为 `len` 的一段 |
-| **按下标取子张量 (索引)** | `x[0]` 或 `x[0, idx]` | `x.i(0)?` 或 `x.i((0, idx))?` | `.i(...)` 即按下标索引（需 `use candle_core::IndexOp;`） |
-| **沿指定维度拼接张量** | `torch.cat([a, b], dim=2)` | `Tensor::cat(&[&a, &b], 2)?` | 沿第 `2` 维将两个张量首尾拼接 |
-| **求最大值所在下标** | `v.argmax(dim=0).item()` | `v.argmax(0)?.to_scalar::<u32>()?` | 找出向量中数值最大的元素下标并转为 `u32` 整数 |
-| **将张量导出为 Rust 数组** | `x.tolist()` | `x.to_vec1::<f32>()?` / `x.to_vec2::<f32>()?` | 将一维或二维张量导出为 `Vec<f32>` 或 `Vec<Vec<f32>>` 以便打印 |
+| 操作功能 | PyTorch 写法 | `candle-core` 写法 |
+|---|---|---|
+| **从数组创建** | `torch.tensor(data).reshape(5, 4)` | `Tensor::from_slice(&data, (5, 4), dev)?` |
+| **全 0 / 全 1** | `torch.zeros((2, 3))` | `Tensor::zeros((2, 3), DType::F32, dev)?` |
+| **查看形状** | `x.shape` | `x.dims()` / `x.dims3()?` |
+| **类型转换** | `x.to(torch.float32)` | `x.to_dtype(DType::F32)?` |
+| **按行号检索** | `table[row_indices]` | `table.index_select(&row_indices, 0)?` |
+| **重塑形状** | `x.reshape(1, 3, 4)` | `x.reshape((1, 3, 4))?` |
+| **展平为一维** | `x.flatten()` | `x.flatten_all()?` |
+| **二维转置** | `w.T` | `w.t()?` |
+| **交换指定维** | `x.transpose(1, 2)` | `x.transpose(1, 2)?` |
+| **内存重排齐** | `x.contiguous()` | `x.contiguous()?` |
+| **矩阵乘法** | `a @ b` | `a.matmul(&b)?` |
+| **逐元素加乘** | `a + b` / `a * b` | `(&a + &b)?` / `(&a * &b)?` |
+| **切片子区间** | `x[offset : offset + len]` | `x.narrow(0, offset, len)?` |
+| **按下标索引** | `x[0, idx]` | `x.i((0, idx))?` |
+| **沿维度拼接** | `torch.cat([a, b], dim=2)` | `Tensor::cat(&[&a, &b], 2)?` |
+| **最大值下标** | `v.argmax(dim=0).item()` | `v.argmax(0)?.to_scalar::<u32>()?` |
+| **导出为数组** | `x.tolist()` | `x.to_vec1::<f32>()?` / `x.to_vec2::<f32>()?` |
+
+> **补充说明**：使用 `.i(...)` 按下标索引前，需在文件顶部引入 `use candle_core::IndexOp;`；`dims3()?` 与 `dims4()?` 可直接将三维或四维张量的形状解构为 Rust 元组 `(d0, d1, d2)`。
 
 ---
 
