@@ -56,9 +56,9 @@ pub fn run_prelude_sandbox(dev: &Device) -> Result<()> {
     );
 
     // -------------------------------------------------------------------------
-    // [3/6] Matrix Multiplication ([M, K] x [K, N] -> [M, N]) & Transpose (.t())
+    // [3/6] Matrix Multiplication ([M, K] x [K, N] -> [M, N]) & 3D-to-2D Flatten
     // -------------------------------------------------------------------------
-    println!("\n--- [3/6] Matrix Multiplication & Middle-Dimension Cancellation ---");
+    println!("\n--- [3/6] Matrix Multiplication, Transpose & 3D <-> 2D Flatten/Unflatten ---");
     // w has shape [2, 4]; to multiply with picked_2d [3, 4], we transpose w to [4, 2]
     let w = Tensor::from_slice(
         &[
@@ -71,12 +71,45 @@ pub fn run_prelude_sandbox(dev: &Device) -> Result<()> {
     let w_t = w.t()?; // [4, 2]
     let out_2d = picked_2d.matmul(&w_t)?; // [3, 4] x [4, 2] -> [3, 2]
     println!(
-        "  picked_2d {:?} x w^T {:?} -> out_2d {:?}: {:?}",
+        "  2D MatMul: picked_2d {:?} x w^T {:?} -> out_2d {:?}: {:?}",
         picked_2d.dims(),
         w_t.dims(),
         out_2d.dims(),
         out_2d.to_vec2::<f32>()?
     );
+
+    // 3D [B=2, M=2, K=3] multiplied by 2D [K=3, N=2]:
+    // 2 classes (B=2), 2 students per class (M=2), 3 scores per student (K=3)
+    let x_3d = Tensor::from_slice(
+        &[
+            // Class 0 (2 students, 3 scores each)
+            1.0f32, 2.0, 3.0, // Class 0 - Student A
+            4.0, 5.0, 6.0, // Class 0 - Student B
+            // Class 1 (2 students, 3 scores each)
+            10.0, 20.0, 30.0, // Class 1 - Student C
+            40.0, 50.0, 60.0, // Class 1 - Student D
+        ],
+        (2, 2, 3),
+        dev,
+    )?;
+    let weight_2d = Tensor::from_slice(
+        &[
+            1.0f32, 1.0, // col 0 = sum of 3 scores; col 1 = first score only
+            1.0, 0.0, //
+            1.0, 0.0, //
+        ],
+        (3, 2),
+        dev,
+    )?;
+    // Step 1 (3D -> 2D): Merge B=2 and M=2 into B*M=4 rows -> [4, 3]
+    let x_flat_2d = x_3d.reshape((2 * 2, 3))?;
+    // Step 2 (2D MatMul): [4, 3] x [3, 2] -> [4, 2]
+    let y_flat_2d = x_flat_2d.matmul(&weight_2d)?;
+    // Step 3 (2D -> 3D): Split 4 rows back into B=2 classes of M=2 students -> [2, 2, 2]
+    let y_3d = y_flat_2d.reshape((2, 2, 2))?;
+    println!("  3D -> 2D Flatten   x_flat_2d {:?}: {:?}", x_flat_2d.dims(), x_flat_2d.to_vec2::<f32>()?);
+    println!("  2D MatMul          y_flat_2d {:?}: {:?}", y_flat_2d.dims(), y_flat_2d.to_vec2::<f32>()?);
+    println!("  2D -> 3D Unflatten y_3d      {:?}: {:?}", y_3d.dims(), y_3d.to_vec3::<f32>()?);
 
     // -------------------------------------------------------------------------
     // [4/6] Matrix Multiplication (matmul) vs. Element-Wise Product (&m1 * &m2)
