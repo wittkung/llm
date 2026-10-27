@@ -141,10 +141,35 @@ Hugging Face（[huggingface.co](https://huggingface.co)）是开源模型权重�
 
 #### （3）model.safetensors：静态参数张量
 
-`model.safetensors` 存储了模型全部 **272 个静态参数张量**（共 `134,515,008` 个参数）：
+`model.safetensors` 以二进制格式存储了模型全部 **272 个静态参数张量**（共 `134,515,008` 个浮点数参数）。文件头部是记录张量名称、数据类型与字节偏移量的 JSON 索引，紧接着是按 64 字节对齐的原始内存块，支持通过 `mmap` 零拷贝映射进内存。
 
-- **BF16 浮点格式**：每个参数采用 2 字节的 **BF16**（Brain Floating Point 16） 存储（1 位符号 + 8 位指数 + 7 位尾数），保留了与 32 位浮点数（FP32）相同的动态范围以防矩阵连乘溢出，同时将文件体积压缩至 $134,515,008 \times 2\text{ Bytes} \approx \mathbf{269.03\text{ MB}}$。
-- **参数的来源与生命周期**：所有权重在预训练之初均由标准差为 $1/\sqrt{d} \approx 0.04167$ 的正态分布随机初始化；在预训练阶段通过预测下一词的交叉熵损失与**反向传播**（Backpropagation）迭代更新；而在我们今天运行的**推理阶段**，全部 272 个张量永久冻结、只读不改。
+围绕这份权重文件，有三个核心问题需要先建立直觉：
+
+**第一，为什么采用 `BF16` 浮点数格式？**
+
+日常代码中的 32 位单精度浮点数（`FP32`）每参数占 4 字节，显存开销过大；而传统 16 位半精度浮点数（`FP16`，1 位符号 + 5 位指数 + 10 位尾数）由于指数位仅有 5 位（最大表示 $65504$），在多层矩阵连乘时极易发生数值溢出（`Inf/NaN`）。
+
+现代大模型普遍采用 **BF16**（Brain Floating Point 16，每参数占 **2 字节**）：它完整保留了与 `FP32` 相同的 **8 位指数位**（1 位符号 + 8 位指数 + 7 位尾数），以牺牲末尾几位尾数精度的微小代价，换取了与 32 位浮点数一致的抗溢出动态范围，并将磁盘与显存体积直接减半：
+
+$$
+134,515,008\text{ 参数} \times 2\text{ Bytes} = 269,030,016\text{ Bytes} \approx \mathbf{269.03\text{ MB}}
+$$
+
+**第二，第一张矩阵 `model.embed_tokens.weight` 有多大？**
+
+词表文件 `tokenizer.json` 仅存文本与整数行号，体积只有 **2.0 MB**。而紧接着它的第一张权重矩阵——**词嵌入矩阵**（Token Embedding Matrix，记作 $\mathbf{W}_E \in \mathbb{R}^{V \times d}$），形状为 `[49152, 576]`，单张矩阵就包含：
+
+$$
+49,152\text{ 行} \times 576\text{ 列} = 28,311,552\text{ 个参数} \quad (\text{占全模型总参数的 } \mathbf{21.05\%}\text{，物理体积 } \mathbf{56.62\text{ MB}})
+$$
+
+它的第 `0` 行至第 `49151` 行，与 `tokenizer.json` 中的 `49,152` 个 Token ID 严格一一对应。
+
+**第三，这些浮点数参数是怎么定出来的？推理时还会变吗？**
+
+- **随机初始化**（训练第 0 步）：模型刚创建时，所有参数仅由均值为 $0$、标准差为 $1/\sqrt{d} \approx 0.04167$ 的正态分布随机数生成器填满，此时每行向量只是随机白噪声。
+- **预训练与反向传播**（训练期持续更新）：在数万亿词的语料上，模型不断执行“根据上文预测下一个词”的任务，计算预测分布与真实下一词之间的**交叉熵损失**（Cross-Entropy Loss），再通过**反向传播**（Backpropagation）计算每个参数的梯度 $\frac{\partial \mathcal{L}}{\partial \mathbf{W}}$ 并由优化器微调数值。经常出现在相似语境中的词（如 `"Rust"` 与 `"C++"`），其对应的 576 维向量会在梯度驱动下在几何空间中彼此靠拢。
+- **推理阶段**（永久冻结、只读不改）：一旦训练完成并导出为 `model.safetensors`，全部 272 个张量即作为**静态权重**永久冻结。本地推理时，模型仅从表中只读拷贝数据，绝不会修改权重文件中的任何数字。
 
 > **为什么不用下载仓库里的其他文件？**
 > - `tokenizer_config.json` / `special_tokens_map.json`：特殊控制词元 ID 已内嵌于 `tokenizer.json` 中，本篇直接在代码中明文书写 ChatML 模板字符串以保持白盒透明；
@@ -337,21 +362,117 @@ $$
 
 ### 02. Embedding 查表
 
-模型以 $[B, T]$ 中的每个整数 ID 为行下标，调用 `index_select` 从词嵌入矩阵 $\mathbf{W}_E \in \mathbb{R}^{V \times d}$ 中抽出对应的 $d$ 维行向量（数学上等价于 $V$ 维独热向量 One-Hot Vector 右乘 $\mathbf{W}_E$）：
+为什么不能把 `input_ids = [1, 3, 4]` 直接送进神经网络做矩阵乘法？
+
+因为整数编号 `1`、`3`、`4` 只是词典里的离散门牌号，本身没有任何代数意义——编号 `4`（`"写"`）绝不等于编号 `1`（`"我"`）加编号 `3`（`"喜欢"`）。要让模型计算词与词之间的语义关联，必须先把每个离散的整数编号映射为一条包含 $d$ 个浮点数的连续向量（在 `SmolLM2-135M` 中 $d = 576$）。
+
+#### （1）按行号从词嵌入矩阵 $\mathbf{W}_E$ 抽取值向量
+
+这项工作由我们在第二节认识的第一张权重矩阵——**词嵌入矩阵** $\mathbf{W}_E \in \mathbb{R}^{V \times d}$（`model.embed_tokens.weight`，形状 `[49152, 576]`）完成。
+
+当形状为 `[B=1, T=3]` 的 `input_ids = [[1, 3, 4]]` 到达时，代码调用 `w_embed.index_select(&flat_ids, 0)`，直接把每个整数 ID 当作**行号**，去 $\mathbf{W}_E$ 中把对应的那一行（长 $d$ 的浮点数向量）整行抽出来：
+
+```text
+词嵌入矩阵 W_E (形状 [V, d])                 抽出的 3 行叠成 H^(0) (形状 [B=1, T=3, d])
+┌──────────────────────────────┐
+│ 第 0 行: [ 0.1,  0.2, ... ]  │
+│ 第 1 行: [ 1.0,  0.0, ... ]  │ ──(取 ID=1)──►  t=0 ("我"):   [ 1.0,  0.0, ... ] (长 d)
+│ 第 2 行: [ 0.5, -0.3, ... ]  │
+│ 第 3 行: [ 0.0,  1.0, ... ]  │ ──(取 ID=3)──►  t=1 ("喜欢"): [ 0.0,  1.0, ... ] (长 d)
+│ 第 4 行: [ 1.0,  1.0, ... ]  │ ──(取 ID=4)──►  t=2 ("写"):   [ 1.0,  1.0, ... ] (长 d)
+│ ...      ...                 │
+└──────────────────────────────┘
+```
+
+把抽出来的 $T = 3$ 行按词语先后顺序上下叠在一起，再在外层套上批大小 $B = 1$ 的括号，原来的每个整数就展开成了一条长度为 $d$ 的向量，张量形状完成了第一次跃迁：
 
 $$
 \text{input\_ids}: [B, T] \xrightarrow{\text{按行查表 } \mathbf{W}_E: [V, d]} \mathbf{H}^{(0)}: [B, T, d]
 $$
 
-查表所得的 $\mathbf{H}^{(0)}$ 即第 0 层初始**隐藏状态**（Hidden States），也称为**残差流**（Residual Stream）——在后续 30 层网络中，主干张量始终保持 $[B, T, d]$ 形状，各层子模块的输出均通过逐元素加法叠加其上。
+> **与独热向量（One-Hot）乘法的等价性**：在数学教材中，这一步常写为将整数 ID 转为仅第 $\text{id}$ 位为 $1$、其余全为 $0$ 的 $V$ 维独热向量 $\mathbf{e}_{\text{id}} \in \{0,1\}^{1 \times V}$，再右乘 $\mathbf{W}_E \in \mathbb{R}^{V \times d}$。工程代码中直接按行下标拷贝内存（`index_select`），省去了 $49,151$ 次乘零运算，数学结果完全等价。
+
+#### （2）什么是隐藏状态（Hidden States）与残差流（Residual Stream）？
+
+查表所得的三维张量 $\mathbf{H}^{(0)}: [B, T, d]$ 称为第 0 层初始**隐藏状态**（Hidden States）。
+
+在 Transformer 架构中，这个形状恒定为 $[B, T, d]$ 的主干张量又被称为**残差流**（Residual Stream）：你可以把它看作一条从第 0 层直通第 30 层出口的主干通道——接下来的每一层注意力子层与 MLP 子层，都只是从这条主干道上读取当前的 $\mathbf{H}^{(\ell)}$，算出一个形状同为 $[B, T, d]$ 的修正增量 $\Delta\mathbf{H}$，然后通过**逐元素加法**（$\mathbf{H} \leftarrow \mathbf{H} + \Delta\mathbf{H}$）叠加回这条主干道上。
+
+---
 
 ### 03. 旋转位置编码（RoPE）
 
-矩阵乘法本身对行顺序不敏感（调换输入词序只会调换输出行序）。为注入序列位置 $t \in \{0, \dots, T-1\}$，现代开源模型普遍采用**旋转位置编码**（Rotary Position Embedding, RoPE）：
+#### （1）为什么矩阵运算需要额外注入位置信息？
 
-1. **子空间配对**：在阶段 04 拆出单头维度 $d_h = 64$ 的查询向量 $\mathbf{Q}$ 与键向量 $\mathbf{K}$（形状 $[B, h, T, 64]$）后，将 64 个维度按半区配对为 **32 组二维向量** $[x_i, x_{i+32}]$（$i = 0 \dots 31$），并按几何级数分配基频 $\omega_i = 1 / 100000^{2i/64}$。
-2. **正交旋转**：对序列位置 $t$ 的词元，使用二维正交旋转矩阵 $\mathbf{R}(t\omega_i)$ 将第 $i$ 组二维子空间旋转 $t\omega_i$ 弧度。
-3. **相对位置点积不变性**：由前置篇证明的正交旋转性质，位置 $m$ 的查询向量与位置 $n$ 的键向量做点积时，旋转矩阵合并为 $\mathbf{R}(m\omega_i)\mathbf{R}(n\omega_i)^\top = \mathbf{R}\big((m-n)\omega_i\big)$，使注意力内积天然仅依赖于两词的**相对距离 $(m - n)$**。
+观察刚刚查表得到的 $\mathbf{H}^{(0)}: [B, T, d]$：第 $0$ 行是第 1 个词的向量，第 $1$ 行是第 2 个词的向量。
+
+在接下来的网络层中，线性投影与前馈网络都是**逐行独立计算**的，而注意力机制的向量点积也只关心“两个向量的内容长什么样”，本身并不知道它们排在第几行。
+
+举个直观的例子：如果把输入句子从 `"猫 追 狗"` 调换成 `"狗 追 猫"`，查表得到的 $\mathbf{H}^{(0)}$ 无非是把第 $0$ 行和第 $2$ 行对调了位置。如果不注入位置序号 $t \in \{0, 1, \dots, T-1\}$，后续所有矩阵算出来的结果也只是原封不动地对调第 $0$ 行和第 $2$ 行——模型根本分不清到底是谁追谁。
+
+#### （2）绝对位置编码 vs. 现代旋转位置编码（RoPE）
+
+怎么把位置序号 $t$ 告诉模型？两代架构采用了截然不同的思路：
+
+- **早期绝对位置编码**（如 GPT-2）：在阶段 02 查表结束后，立刻给第 $t$ 行的词向量直接加上一条代表“第 $t$ 号座位”的固定位置向量 $\mathbf{p}_t \in \mathbb{R}^d$（即 $\mathbf{H}^{(0)}_t \leftarrow \mathbf{H}^{(0)}_t + \mathbf{p}_t$）。
+  **缺陷**：自然语言中最核心的是词与词之间的**相对距离**（比如形容词紧挨在名词前面 1 个位置），而不是绝对座位号。如果硬加绝对位置向量，同一个词组出现在第 2 个词和出现在第 500 个词时，向量数值完全不同，模型很难泛化到长文本。
+- **现代旋转位置编码**（Rotary Position Embedding, **RoPE**，如 Llama、Qwen、SmolLM2）：在阶段 02 查表后**不修改 $\mathbf{H}^{(0)}$**；而是等到下一阶段（阶段 04）生成注意力查询向量 $\mathbf{Q}$ 和键向量 $\mathbf{K}$ 时，根据词元所在的位置下标 $t$，把向量在平面上**旋转一个与 $t$ 成正比的角度 $t\theta$**！
+
+#### （3）RoPE 是怎样旋转一个 64 维向量的？（分三步拆解）
+
+我们在前置篇第三节学过，二维平面旋转矩阵 $\mathbf{R}(\alpha) = \begin{bmatrix} \cos\alpha & -\sin\alpha \\ \sin\alpha & \cos\alpha \end{bmatrix}$ 每次只能旋转一个包含 **2 个数字**的二维向量 $[x^{(1)}, x^{(2)}]$。
+
+而在 `SmolLM2-135M` 中，每个注意力头的查询向量 $\mathbf{q}$ 和键向量 $\mathbf{k}$ 长度为 **$d_h = 64$**。怎么旋转一个 64 维向量？RoPE 的做法非常巧妙，分三步完成：
+
+**第一步：两两配对，拆成 32 组二维坐标**（半区配对）
+
+把长度为 $64$ 的向量 $[x_0, x_1, \dots, x_{63}]$ 前半区（下标 $0 \dots 31$）和后半区（下标 $32 \dots 63$）一一配对，分成 **32 组独立的二维向量**：
+
+- 第 $0$ 组：$\begin{bmatrix} x_0 \\ x_{32} \end{bmatrix}$，第 $1$ 组：$\begin{bmatrix} x_1 \\ x_{33} \end{bmatrix}$，$\dots$，第 $i$ 组：$\begin{bmatrix} x_i \\ x_{i+32} \end{bmatrix}$，$\dots$，第 $31$ 组：$\begin{bmatrix} x_{31} \\ x_{63} \end{bmatrix}$。
+
+**第二步：按位置下标 $t$ 成倍旋转**（第 $t$ 个词就转 $t$ 倍角度）
+
+给第 $i$ 组二维向量设定一个固定的“单步旋转角” $\omega_i$（称为**基准角频率**）。当词元处在序列的第 $t$ 个位置（$t = 0, 1, 2, \dots$）时，就把这组二维向量旋转 **$t \cdot \omega_i$** 弧度：
+
+- **位置 $t = 0$**（第 1 个词）：旋转 $0 \cdot \omega_i = 0$ 弧度（保持原样不转）；
+- **位置 $t = 1$**（第 2 个词）：旋转 $1 \cdot \omega_i$ 弧度；
+- **位置 $t = 2$**（第 3 个词）：旋转 $2 \cdot \omega_i$ 弧度；
+- **通用位置 $t$**：乘上旋转角为 $t\omega_i$ 的二维正交旋转矩阵 $\mathbf{R}(t\omega_i)$：
+
+$$
+\begin{bmatrix} x'_i \\ x'_{i+32} \end{bmatrix} =
+\underbrace{\begin{bmatrix} \cos(t\omega_i) & -\sin(t\omega_i) \\ \sin(t\omega_i) & \cos(t\omega_i) \end{bmatrix}}_{\mathbf{R}(t\omega_i)}
+\begin{bmatrix} x_i \\ x_{i+32} \end{bmatrix}
+=
+\begin{bmatrix}
+x_i \cos(t\omega_i) - x_{i+32} \sin(t\omega_i) \\
+x_i \sin(t\omega_i) + x_{i+32} \cos(t\omega_i)
+\end{bmatrix}
+$$
+
+**第三步：32 组采用快慢不同的旋转速度**（高低频多尺度表盘）
+
+为什么 32 组二维向量不干脆用同一个旋转步长 $\omega$，而要按几何级数公式 $\omega_i = \frac{1}{100000^{2i / 64}}$（其中 `100000` 即 `config.json` 中的 `rope_theta`）让每一组的旋转步长越来越慢？
+
+这就好比钟表必须同时拥有**秒针、分针和时针**：
+
+- **第 $0$ 组**（高频“秒针”，$i=0$）：$\omega_0 = \frac{1}{100000^0} = \mathbf{1.0}$ 弧度/词（每往后走 1 个词就大幅旋转约 $57.3^\circ$）。它对相邻一两个词的先后次序极其敏感，但每过 $6$ 个词就会转满一圈（$360^\circ$）发生角度重叠；
+- **中间组**（中频“分针”）：旋转速度适中，负责分辨几十到几百个词之间的中距离结构；
+- **第 $31$ 组**（超低频“时针”，$i=31$）：$\omega_{31} = \frac{1}{100000^{62/64}} \approx \mathbf{0.000014}$ 弧度/词。它转得极慢，哪怕横跨 $8,192$ 个词的上下文窗口也不会转满一圈，专门负责感知长文档的宏观远近距离。
+
+#### （4）为什么这样旋转就能让模型只看“相对距离 $(m - n)$”？
+
+这正是我们在前置篇第三节证明过的**正交旋转矩阵点积保角性**！
+
+当序列位置 $m$ 的查询向量 $\mathbf{q}_m$（已旋转 $m\omega_i$ 角）与位置 $n$ 的键向量 $\mathbf{k}_n$（已旋转 $n\omega_i$ 角）在注意力层做点积时，两个旋转矩阵合二为一：
+
+$$
+(\mathbf{q}_m \mathbf{R}(m\omega_i)) \cdot (\mathbf{k}_n \mathbf{R}(n\omega_i)) = \mathbf{q}_m \, \mathbf{R}(m\omega_i)\mathbf{R}(n\omega_i)^\top \, \mathbf{k}_n^\top = \mathbf{q}_m \, \mathbf{R}\big((m - n)\omega_i\big) \, \mathbf{k}_n^\top
+$$
+
+你看！绝对位置 $m$ 和 $n$ 自动抵消成了它们的差值 **$(m - n)$**！
+
+这意味着：无论 `"喜欢"` 和 `"写"` 这两个词出现在句首的位置 $(1, 2)$，还是出现在长文末尾的位置 $(501, 502)$，只要它们一前一后相隔 $1$ 个词（$m - n = 1$），它们旋转后的夹角差就恒等于 $1 \cdot \omega_i$，算出来的注意力匹配分数完全一致！这就是 RoPE 统治现代开源大模型的数学原因。
 
 ---
 
@@ -402,50 +523,122 @@ flowchart TD
 
 ### 04. QKV 线性投影与拆头
 
-为实现非对称的上下文检索，模型先用三张参数矩阵 $\mathbf{W}_Q, \mathbf{W}_K, \mathbf{W}_V$ 将输入隐藏状态 $\mathbf{H}$ 投影为三份角色：
+#### （1）为什么要投影出 Q、K、V 三个矩阵，而不能直接拿 $\mathbf{H}$ 和自己做点积？
 
-- **查询**（Query, $\mathbf{Q}$）：当前位置发出的检索特征向量；
-- **键**（Key, $\mathbf{K}$）：各位置供检索匹配的特征索引向量；
-- **值**（Value, $\mathbf{V}$）：配对成功后实际被提取搬运的内容向量。
+在进入注意力层时，我们手头只有一张隐藏状态 $\mathbf{H}: [B, T, d]$。如果直接拿 $\mathbf{H}$ 和它自己的转置做点积（$\mathbf{H}\mathbf{H}^\top$），由于任何向量永远和它自己一模一样（夹角为 $0^\circ$），算出来的最高分永远在对角线上——每个词都只会死盯着自己看！
+
+而在真实语言里，上下文检索是**非对称**的：比如当读到代词 `"它"` 时，`"它"` 需要去前面寻找一个**名词**（如 `"手机"`），而不是寻找另一个 `"它"`。
+
+为了实现这种“提问者”与“被检索者”的分离，模型用三张独立训练的参数矩阵 $\mathbf{W}_Q, \mathbf{W}_K, \mathbf{W}_V$，把同一个输入隐藏状态 $\mathbf{H}$ 投影成三份职责截然不同的中间激活：
+
+- **查询向量**（Query, $\mathbf{Q}$）：当前位置发出的检索条件——代表“我正在前文中寻找什么特征？”；
+- **键向量**（Key, $\mathbf{K}$）：每个位置对外展示的特征标签——代表“我自身具备什么语法或语义属性可供匹配？”；
+- **值向量**（Value, $\mathbf{V}$）：一旦 $\mathbf{Q}$ 与 $\mathbf{K}$ 配对成功，该位置实际交出来供汇总融合的语义内容向量。
 
 $$
 \mathbf{Q}_{\text{raw}} = \mathbf{H}\mathbf{W}_Q^\top, \quad \mathbf{K}_{\text{raw}} = \mathbf{H}\mathbf{W}_K^\top, \quad \mathbf{V}_{\text{raw}} = \mathbf{H}\mathbf{W}_V^\top
 $$
 
-> **权重转置说明**：Hugging Face `.safetensors` 中的线性层权重統一按 `[输出维度, 输入维度]` 存储，因此代码中计算线性投影时均需右乘转置矩阵 $\mathbf{W}^\top$。
+> **为什么公式里写的是转置 $\mathbf{W}^\top$？**
+> 在 Hugging Face `.safetensors` 文件中，线性层权重统一按 `[输出维度, 输入维度]` 存放（如 `k_proj.weight` 形状为 `[192, 576]`）。当形状为 `[B, T, 576]` 的激活右乘权重时，必须先将权重转置为 `[576, 192]`，才能消去内侧维度 `576` 得到 `[B, T, 192]`。
 
-**拆分注意力头（Split Heads）与分组查询注意力（GQA）：**
+#### （2）为什么要拆分注意力头（Split Heads）？怎么拆？
 
-为了让不同子空间同时捕捉语法、指代等多种语义关系，模型将总宽度 $d$ 拆分为多个单头宽度 $d_h = 64$ 的子空间，并通过 `reshape` 与 `transpose(1, 2)` 将头维度换到序列维度之前：
+一句话里往往同时存在多条线索：既有动词找宾语的语法关系，又有代词找先行词的指代关系。如果把 $d = 576$ 维捆在一起只算一组注意力概率，多种关系就会在一次加权平均里互相混杂。
+
+因此，模型把总特征维度拆分成多个独立的**注意力头**（Attention Heads，每个头的子空间宽度固定为 $d_h = 64$），让每个头在自己的 64 维子空间里独立计算一套注意力权重。
+
+在代码中，“拆头”不需要乘任何参数矩阵，直接用我们在前置篇第五节学过的 **`reshape` + `transpose(1, 2)`** 两步完成（以 $h_q = 9$ 个查询头为例）：
+
+1. **第一步 `reshape`**（把 576 拆成 $9 \times 64$）：将 `[B, T, 576]` 重塑为四维张量 `[B, T, 9, 64]`（代表 $B$ 个批次、$T$ 个词、每个词有 $9$ 个头、每头 $64$ 维）；
+2. **第二步 `transpose(1, 2)`**（把“头维度”换到前面）：交换第 1 维（$T$）和第 2 维（$9$），形状变成 **`[B, 9, T, 64]`**——这样最内侧的两维就变成了干净的 `[T, 64]` 二维矩阵，使 9 个注意力头可以各自并行计算 `[T, 64] × [64, T] -> [T, T]`！
 
 $$
-[B, T, h \cdot d_h] \xrightarrow{\text{Reshape}} [B, T, h, d_h] \xrightarrow{\text{Transpose}(1,2)} [B, h, T, d_h]
+[B, T, h \cdot d_h] \xrightarrow{\text{1. Reshape 拆维}} [B, T, h, d_h] \xrightarrow{\text{2. Transpose}(1,2)\text{ 换轴}} [B, h, T, d_h]
 $$
 
-在 `SmolLM2-135M` 中，查询头有 $h_q = 9$ 个（$\mathbf{Q}$ 形状为 `[B, 9, T, 64]`），而键值头采用**分组查询注意力**（Grouped-Query Attention, GQA），仅有 $h_{kv} = 3$ 个（$\mathbf{K}, \mathbf{V}$ 形状为 `[B, 3, T, 64]`）。在计算点积前，代码通过 `repeat_kv` 将 3 个键值头各复制 3 份广播为 `[B, 9, T, 64]`，使每 3 个查询头共享 1 组键值头，从而将 KV 缓存显存占用降低三分之二。
+拆成 `[B, h, T, 64]` 之后，代码紧接着对 $\mathbf{Q}$ 和 $\mathbf{K}$ 调用阶段 03 介绍的 **RoPE 旋转位置编码**（注意：值向量 $\mathbf{V}$ 不参与计算匹配分数，因此**只旋转 $\mathbf{Q}$ 和 $\mathbf{K}$，不旋转 $\mathbf{V}$**）。
+
+#### （3）什么是分组查询注意力（GQA）？（为什么 Q 是 9 个头，K 和 V 只有 3 个头？）
+
+在早期的标准多头注意力（MHA）中，查询头、键头、值头的数量完全相等（都是 9 个头）。但在推理生成长文时，每一层都要把历史所有词的 $\mathbf{K}$ 和 $\mathbf{V}$ 缓存在显存里（即第十节的 KV Cache），9 个键值头非常占显存。
+
+为了给显存减负，`SmolLM2-135M` 采用了现代大模型标配的**分组查询注意力**（Grouped-Query Attention, **GQA**）：
+
+- **查询头保留 $h_q = 9$ 个**：`q_proj.weight` 形状为 `[576, 576]`（$9 \times 64 = 576$），拆头后 $\mathbf{Q}$ 形状为 **`[B, 9, T, 64]`**；
+- **键值头缩减为 $h_{kv} = 3$ 个**：`k_proj.weight` 与 `v_proj.weight` 形状只有 **`[192, 576]`**（$3 \times 64 = 192$），拆头后 $\mathbf{K}, \mathbf{V}$ 形状为 **`[B, 3, T, 64]`**（显存直接省去三分之二！）；
+- **3:1 共享广播**（`repeat_kv`）：在进入阶段 05 做点积前，程序调用我们在前置篇第五节学过的 `unsqueeze -> expand -> reshape` 把 3 个键值头各自原地复制 3 份（第 `0,1,2` 号查询头共享第 `0` 号键值头，第 `3,4,5` 号共享第 `1` 号，第 `6,7,8` 号共享第 `2` 号），将 $\mathbf{K}, \mathbf{V}$ 广播对齐为 **`[B, 9, T, 64]`**。
+
+---
 
 ### 05. 缩放点积注意力与因果掩码
 
-每个注意力头将 $\mathbf{Q}$ 与转置后的 $\mathbf{K}^\top: [B, h, d_h, T]$ 相乘，消去内侧维度 $d_h$，并除以缩放因子 $\sqrt{d_h}$ 以稳定方差：
+现在，9 个注意力头各自拿到了一份形状为 $[T, d_h]$（$d_h = 64$）的 $\mathbf{Q}$、$\mathbf{K}$ 和 $\mathbf{V}$。注意力机制的计算按顺序分四步走：
+
+#### 第一步：计算 QK 点积匹配分数（`[T, 64] × [64, T] -> [T, T]`）
+
+把键张量 $\mathbf{K}: [B, h, T, d_h]$ 的最后两维转置为 $\mathbf{K}^\top: [B, h, d_h, T]$，与查询张量 $\mathbf{Q}: [B, h, T, d_h]$ 相乘。内侧的单头维度 $d_h = 64$ 在点积求和中消去，产出一个 $T \times T$ 的方阵：
 
 $$
-\mathbf{S} = \frac{\mathbf{Q}\mathbf{K}^\top}{\sqrt{d_h}}, \qquad \text{Shape: } [B, h, T, d_h] \times [B, h, d_h, T] \longrightarrow [B, h, T, T]
+\mathbf{Q}\mathbf{K}^\top : [B, h, T, d_h] \times [B, h, d_h, T] \longrightarrow [B, h, T, T]
 $$
 
-自回归语言模型必须严格遵守**因果律**（Causality）：位置 $i$ 的词元只能看到 $j \le i$ 的历史与当前位置，绝不能偷看 $j > i$ 的未来位置。
+在这个 $T \times T$ 方阵中，**第 $i$ 行、第 $j$ 列的数字，就代表“第 $i$ 个词的查询向量 $\mathbf{q}_i$”与“第 $j$ 个词的键向量 $\mathbf{k}_j$”之间的点积相似度**。
 
-模型在分数方阵 $\mathbf{S}$ 上叠加一个上三角全为 $-\infty$、下三角及对角线全为 $0$ 的**因果掩码**（Causal Mask），再按行执行 $\operatorname{softmax}$ 归一化（上三角经 $e^{-\infty} = 0$ 后权重严格归零），最后左乘值矩阵 $\mathbf{V}$：
+#### 第二步：除以缩放因子 $\sqrt{d_h}$
+
+当单头维度 $d_h = 64$ 时，64 个乘积加在一起会让点积数值的方差放大 64 倍（标准差放大 $\sqrt{64} = 8$ 倍）。如果点积数值过大，下一步求指数 $e^x$ 时就会导致最大值垄断近 100% 的权重、其余位置梯度趋近于 $0$（称为 Softmax 饱和）。
+
+因此，必须将点积矩阵的每个元素除以常数 $\sqrt{d_h} = \sqrt{64} = 8$，将数值拉回温和区间：
 
 $$
-\mathbf{A} = \operatorname{softmax}\left(\frac{\mathbf{Q}\mathbf{K}^\top}{\sqrt{d_h}} + \text{mask}\right) \in \mathbb{R}^{[B, h, T, T]}, \qquad \mathbf{O}_h = \mathbf{A}\mathbf{V} \in \mathbb{R}^{[B, h, T, d_h]}
+\mathbf{S} = \frac{\mathbf{Q}\mathbf{K}^\top}{\sqrt{d_h}}, \qquad \text{Shape: } [B, h, T, T]
 $$
+
+#### 第三步：施加因果掩码（Causal Mask，严禁偷看未来）
+
+自回归语言模型有一条铁律：**因果性**（Causality）——当模型在第 $i$ 个词的位置预测下一个词时，它只能看到位置 $j \le i$ 的前文和自己，**绝对不能偷看位置 $j > i$ 的未来词元**！
+
+以 $T = 3$ 个词（$t=0, 1, 2$）为例，在 $3 \times 3$ 的分数方阵中：
+
+- 左下角及对角线（$j \le i$）是合法的历史与当前位置，掩码值为 **`0`**（加上 $0$ 不改变原分数）；
+- 右上角严格上三角区域（$j > i$，即第 0 行看第 1、2 列，第 1 行看第 2 列）属于“偷看未来”，掩码矩阵将其设为**负无穷 $-\infty$**：
+
+$$
+\text{mask}_{[3 \times 3]} = \begin{bmatrix}
+0 & -\infty & -\infty \\
+0 & 0 & -\infty \\
+0 & 0 & 0
+\end{bmatrix}, \qquad \mathbf{S}_{\text{masked}} = \mathbf{S} + \text{mask}
+$$
+
+#### 第四步：按行 Softmax 归一化并乘值矩阵 $\mathbf{V}$
+
+对 $\mathbf{S}_{\text{masked}}$ 的**每一行**独立执行我们在前置篇第六节学过的 $\operatorname{softmax}$ 归一化。由于右上角未来位置全是 $-\infty$，取指数后 $e^{-\infty} = \mathbf{0}$，未来位置的权重被彻底归零，而每一行合法历史位置的权重之和严格等于 $1.0$：
+
+$$
+\mathbf{A} = \operatorname{softmax}\left(\frac{\mathbf{Q}\mathbf{K}^\top}{\sqrt{d_h}} + \text{mask}\right), \qquad \text{Shape: } [B, h, T, T]
+$$
+
+最后，拿这张每行和为 $1$ 的注意力权重方阵 $\mathbf{A}: [B, h, T, T]$ 左乘值矩阵 $\mathbf{V}: [B, h, T, d_h]$。内侧的维度 $T$ 消去，尾部的 $d_h$ 重新浮现，把前文各位置的 $\mathbf{V}$ 向量按注意力权重加权融合到了当前位置上：
+
+$$
+\mathbf{O}_h = \mathbf{A}\mathbf{V} : [B, h, T, T] \times [B, h, T, d_h] \longrightarrow [B, h, T, d_h]
+$$
+
+---
 
 ### 06. 多头合并与输出投影
 
-将 $h$ 个头的输出 $\mathbf{O}_h: [B, h, T, d_h]$ 经 `transpose(1, 2)`、`.contiguous()` 与 `reshape` 重新拼接为 $\mathbf{O}_{\text{concat}}: [B, T, d]$，再右乘输出投影矩阵 $\mathbf{W}_O^\top \in \mathbb{R}^{d \times d}$ 融合各头信息：
+现在，$h = 9$ 个注意力头各自算出了自己的上下文聚合结果 $\mathbf{O}_h: [B, 9, T, 64]$。怎样把它们合回残差流主干所需的 $[B, T, 576]$？
+
+只需把阶段 04 的拆头动作反过来执行，再乘一张融合矩阵：
+
+1. **换轴拼回 `[B, T, 576]`**：先调 `.transpose(1, 2)?.contiguous()?` 把形状变回 `[B, T, 9, 64]`，再调 `.reshape((b, t, 576))?` 将每个词的 9 个 64 维子向量首尾拼接成一条 576 维向量 $\mathbf{O}_{\text{concat}}: [B, T, 576]$；
+2. **右乘输出投影矩阵 $\mathbf{W}_O^\top$**：单纯拼接后，前 64 维只来自第 0 个头，第 64..128 维只来自第 1 个头，各头之间还没有交换信息。因此最后必须右乘本层第 4 张注意力参数矩阵 $\mathbf{W}_O^\top \in \mathbb{R}^{576 \times 576}$（`self_attn.o_proj.weight`），让 9 个头提取到的特征充分线性混合，交出注意力子层的最终增量 $\Delta\mathbf{H}_{\text{attn}}$：
 
 $$
-\Delta\mathbf{H}_{\text{attn}} = \mathbf{O}_{\text{concat}} \mathbf{W}_O^\top, \qquad \text{Shape: } [B, T, d]
+\Delta\mathbf{H}_{\text{attn}} = \mathbf{O}_{\text{concat}} \mathbf{W}_O^\top, \qquad \text{Shape: } [B, T, d] \times [d, d] \longrightarrow [B, T, d]
 $$
 
 ---
@@ -650,61 +843,121 @@ let o_concat = context.transpose(1, 2)?.contiguous()?.reshape((b, t, d))?;
 
 ## 七、 残差流、MLP 与词表打分（阶段 07 — 11）
 
-### 07. 残差连接、RMSNorm 与 SwiGLU MLP
+### 07. 残差连接、Pre-RMSNorm 与 SwiGLU MLP
 
-注意力子层算出上下文增量 $\Delta\mathbf{H}_{\text{attn}}$ 后，通过**残差连接**（Residual Connection）直接叠加回输入主干：
+#### （1）第一次残差相加与 Pre-RMSNorm 归一化
+
+注意力子层算出上下文增量 $\Delta\mathbf{H}_{\text{attn}}: [B, T, d]$ 后，模型不会用它覆盖掉原来的输入 $\mathbf{H}^{(0)}$，而是执行一次**逐元素加法**（即**残差连接** Residual Connection）：
 
 $$
 \mathbf{H}_{\text{mid}} = \mathbf{H}^{(0)} + \Delta\mathbf{H}_{\text{attn}}, \qquad \text{Shape: } [B, T, d]
 $$
 
-随后，$\mathbf{H}_{\text{mid}}$ 先经过 `post_attention_layernorm`（**RMSNorm 均方根归一化**）得到 $\mathbf{X}_{\text{norm}}: [B, T, d]$，再进入 **SwiGLU（Swish-Gated Linear Unit）前馈网络**。
+为什么要用加法而不是直接替换？因为当网络堆叠到 30 层甚至上百层时，如果每一层都直接覆写张量，底层的原始词义特征与反向传播梯度很容易在连乘中消失；而通过残差加法 $\mathbf{H} + \Delta\mathbf{H}$，主干残差流始终畅通无阻，每一层只需专注于计算“当前层需要补充的修正量 $\Delta\mathbf{H}$”。
 
-与跨位置交互的注意力层不同，MLP 仅在每个序列位置 $t$ 自身的向量上独立执行三步非线性变换：
+同时要注意归一化的位置：现代 Llama / SmolLM2 架构统一采用 **Pre-RMSNorm**（前置均方根归一化）——即保持主干残差流 $\mathbf{H}$ 原样不变，仅在**进入自注意力子层之前**（`input_layernorm`）和**进入 MLP 子层之前**（`post_attention_layernorm`）对分支输入做均方根归一化（公式见前置篇第六节）：
 
-1. **双路升维投影**（$576 \to 1536$）：$\mathbf{X}_{\text{norm}}$ 同时右乘 $\mathbf{W}_{\text{up}}^\top$ 得到候选特征 $\mathbf{U} = \mathbf{X}_{\text{norm}}\mathbf{W}_{\text{up}}^\top$，右乘 $\mathbf{W}_{\text{gate}}^\top$ 并经 $\operatorname{SiLU}(x) = x\sigma(x)$ 激活得到门控张量 $\mathbf{G} = \operatorname{SiLU}(\mathbf{X}_{\text{norm}}\mathbf{W}_{\text{gate}}^\top)$，两者形状均为 $[B, T, 1536]$；
-2. **Hadamard 逐元素门控**：计算逐元素乘积 $\mathbf{G} \odot \mathbf{U}: [B, T, 1536]$，动态过滤并调制特征分量；
-3. **降维线性投影**（$1536 \to 576$）：右乘 $\mathbf{W}_{\text{down}}^\top$ 还原回 $[B, T, 576]$，并再次与残差流相加：
+$$
+\mathbf{X}_{\text{norm}} = \operatorname{RMSNorm}(\mathbf{H}_{\text{mid}}) = \frac{\mathbf{H}_{\text{mid}}}{\sqrt{\frac{1}{d}\sum_{i=1}^d H_{\text{mid}, i}^2 + \epsilon}} \odot \boldsymbol{\gamma}, \qquad \text{Shape: } [B, T, d]
+$$
+
+#### （2）SwiGLU 前馈网络（MLP）的三步非线性变换
+
+如果说刚才的注意力层负责的是**跨位置搬运上下文信息**（让位置 $t$ 吸收位置 $0 \dots t-1$ 的特征），那么接下来的**多层感知机**（MLP / Feed-Forward Network）负责的就是**单位置内部的特征非线性加工与知识提取**——在 MLP 内部，不同位置 $t$ 之间没有任何交互，计算完全在每个词自己的 576 维向量上独立进行。
+
+现代大模型普遍采用包含三张权重矩阵（`gate_proj`、`up_proj`、`down_proj`）的 **SwiGLU**（Swish-Gated Linear Unit）结构，分三步对 $\mathbf{X}_{\text{norm}}: [B, T, 576]$ 做变换：
+
+**第一步：双路并联升维投影**（`[B, T, 576] -> [B, T, 1536]`）
+
+把 576 维向量同时送入两条并联支路，各自右乘一张形状为 `[1536, 576]` 的转置矩阵，将特征空间撑宽至近 3 倍的中间维度 $d_{ff} = 1536$：
+
+- **候选特征支路**（Up Projection）：$\mathbf{U} = \mathbf{X}_{\text{norm}}\mathbf{W}_{\text{up}}^\top$，形状为 `[B, T, 1536]`；
+- **门控开关支路**（Gate Projection + SiLU 激活）：先乘 $\mathbf{W}_{\text{gate}}^\top$ 得到 `[B, T, 1536]`，再逐元素通过我们在前置篇第六节学过的 $\operatorname{SiLU}(x) = \frac{x}{1 + e^{-x}}$ 非线性激活函数，得到门控张量 $\mathbf{G} = \operatorname{SiLU}(\mathbf{X}_{\text{norm}}\mathbf{W}_{\text{gate}}^\top)$。
+
+**第二步：Hadamard 逐元素门控相乘**（`[B, T, 1536]`）
+
+将门控支路 $\mathbf{G}$ 与候选特征支路 $\mathbf{U}$ 做**逐元素乘法**（$\mathbf{G} \odot \mathbf{U}$，代码中为 `(&gate * &up)?`）：当门控张量 $\mathbf{G}$ 的某个维度接近 $0$ 时，就像开关一样把 $\mathbf{U}$ 对应维度的特征过滤关断；当 $\mathbf{G}$ 数值较大时则予以放行放大。
+
+**第三步：降维还原并写回残差流**（`[B, T, 1536] -> [B, T, 576]`）
+
+将门控调制后的 1536 维张量右乘第三张矩阵 $\mathbf{W}_{\text{down}}^\top$（`down_proj.weight`，形状 `[576, 1536]` 转置为 `[1536, 576]`），压缩回主干宽度 `[B, T, 576]`，并执行本层的第二次残差相加：
 
 $$
 \Delta\mathbf{H}_{\text{mlp}} = \big(\operatorname{SiLU}(\mathbf{X}_{\text{norm}}\mathbf{W}_{\text{gate}}^\top) \odot (\mathbf{X}_{\text{norm}}\mathbf{W}_{\text{up}}^\top)\big)\mathbf{W}_{\text{down}}^\top, \qquad \mathbf{H}^{(1)} = \mathbf{H}_{\text{mid}} + \Delta\mathbf{H}_{\text{mlp}}
 $$
 
+至此，第 0 层 Transformer 全部计算完毕：输入是 $\mathbf{H}^{(0)}: [B, T, 576]$，输出是融合了第 0 层上下文与非线性特征的 $\mathbf{H}^{(1)}: [B, T, 576]$。
+
+---
+
 ### 08. 串联多层 Transformer
 
-由于单层 Transformer 严格保持输入与输出形状均为 $[B, T, d]$，主干网络将 $L = 30$ 层结构相同的模块直接串联：
+正因为单层 Transformer 严格遵守“输入 $[B, T, d]$、输出 $[B, T, d]$”的形状守恒契约，主干网络才能把 $L = 30$ 层结构完全相同（但各自拥有独立训练参数）的 Transformer 层像接力赛一样直接串联起来：
 
 $$
 \mathbf{H}^{(0)} \xrightarrow{\text{Layer } 0} \mathbf{H}^{(1)} \xrightarrow{\text{Layer } 1} \cdots \xrightarrow{\text{Layer } 29} \mathbf{H}^{(30)} \xrightarrow{\text{Final RMSNorm}} \mathbf{H}_{\text{final}}: [B, T, d]
 $$
 
-走出第 29 层后，张量经过第 272 个权重 `model.norm.weight` 完成最终均方根归一化，得到 $\mathbf{H}_{\text{final}}: [B, T, d]$。
+- **浅层**（如第 $0 \dots 5$ 层）：主要整合局部相邻词的词法与短语搭配；
+- **中层**（如第 $6 \dots 20$ 层）：梳理跨句子的代词指代、语法角色与逻辑结构；
+- **深层**（如第 $21 \dots 29$ 层）：将上下文信息逐步收敛到“当前位置接下来应该输出什么词”的预测方向上。
+
+走出第 29 层后，张量经过全模型第 272 个权重 `model.norm.weight`（形状 `[576]`）做最后一次全局 RMSNorm 幅度校准，得到最终隐藏状态 $\mathbf{H}_{\text{final}}: [B, T, 576]$。
+
+---
 
 ### 09. 输出投影（LM Head）与权重绑定
 
-为了将 $d = 576$ 维特征向量转化为词表 $V = 49,152$ 个候选词的预测得分，模型将 $\mathbf{H}_{\text{final}}$ 右乘**语言模型输出头**（LM Head）转置矩阵 $\mathbf{W}_{\text{head}}^\top \in \mathbb{R}^{d \times V}$，得到**未归一化对数概率**（Logits）：
+现在，我们手头有了每个位置的 576 维最终特征向量 $\mathbf{H}_{\text{final}}: [B, T, 576]$。怎样把这 576 个浮点数翻译回词表里 $V = 49,152$ 个候选词各自的预测得分？
+
+还记得阶段 02 入口处那张形状为 `[49152, 576]` 的词嵌入表 $\mathbf{W}_E$ 吗？
+
+- **在阶段 02 入口处**：我们拿整数行号去表里查出对应的 `576` 维词向量；
+- **在阶段 09 出口处**：我们正好把这个过程倒过来——把这张表转置为 **`[576, 49152]`**（充当**语言模型输出头 LM Head**，$\mathbf{W}_{\text{head}}^\top$），让 $\mathbf{H}_{\text{final}}: [B, T, 576]$ 与这 `49,152` 列候选词向量逐一做点积！
 
 $$
-\text{logits}_{\text{all}} = \mathbf{H}_{\text{final}} \mathbf{W}_{\text{head}}^\top, \qquad \text{Shape: } [B, T, d] \times [d, V] \longrightarrow [B, T, V]
+\text{logits}_{\text{all}} = \mathbf{H}_{\text{final}} \mathbf{W}_{\text{head}}^\top, \qquad \text{Shape: } [B, T, 576] \times [576, 49152] \longrightarrow [B, T, 49152]
 $$
+
+从向量点积的几何意义来看，这一步再直观不过了：**最终隐藏状态 $\mathbf{H}_{\text{final}}$ 与词表里第 $k$ 号候选词的向量方向越接近，点积算出来的得分（称为未归一化对数概率 Logits）就越高！**
 
 > **首尾词表权重绑定**（Weight Tying）：
-> - **3B 及以下轻量模型**（`tie_word_embeddings: true`）：如 `SmolLM2-135M`、`Qwen2.5-0.5B`、`Llama-3.2-1B`。由于词表矩阵占比极高（本模型单张表即占总参数的 21.05%），出口处的 $\mathbf{W}_{\text{head}}$ 直接复用阶段 02 入口处的词嵌入矩阵 $\mathbf{W}_E$，因此在 `.safetensors` 中不存在独立的 `lm_head.weight` 键；
-> - **7B 及以上中大型模型**（`tie_word_embeddings: false`）：参数预算充裕，为避免首尾梯度互相干扰并便于跨卡流水线并行，入口 `embed_tokens.weight` 与出口 `lm_head.weight` 解绑为两张独立矩阵。
+> - **3B 及以下轻量模型**（`tie_word_embeddings: true`）：如 `SmolLM2-135M`、`Qwen2.5-0.5B`、`Llama-3.2-1B`。由于词表矩阵占比极高（本模型单张表即占总参数的 21.05%），出口处的 $\mathbf{W}_{\text{head}}$ 在物理内存中直接复用了阶段 02 入口处的 `model.embed_tokens.weight`，因此在 `.safetensors` 中不存在独立的 `lm_head.weight` 键；
+> - **7B 及以上中大型模型**（`tie_word_embeddings: false`）：参数预算充裕，为避免同一个矩阵在训练时同时承受入口特征提取与出口分类器两股方向的梯度拉扯，入口 `embed_tokens.weight` 与出口 `lm_head.weight` 解绑为两张独立的 `[V, d]` 矩阵。
+
+---
 
 ### 10. 选出下一个 Token
 
-在 $\text{logits}_{\text{all}}: [B, T, V]$ 中，第 $t$ 行的 $V$ 个分数代表模型在看到前 $t+1$ 个词后对下一个词的预测（训练阶段利用全部 $T$ 行并行计算交叉熵损失）。
+看着形状为 $[B, T, V]$（如 `[1, 3, 49152]`）的 $\text{logits}_{\text{all}}$，初学者常会问：**我们明明只想要预测整句话后面的那 1 个新词，为什么模型一口气算出了全部 $T = 3$ 行的 49,152 维得分？前两行是干嘛的？**
 
-而在推理阶段，前 $T-1$ 个词已是已知输入，因此直接切出序列最后一个位置（下标 $T-1$），并通过 $\arg\max$（贪心解码）选出得分最高的 Token ID：
+这正是阶段 05 因果掩码留下的结构印记（以输入 `"我 喜欢 写"` 为例）：
+
+- **第 $0$ 行**（$t=0$，此时只看到 `"我"`）：预测的是 `"我"` 后面该接什么词；
+- **第 $1$ 行**（$t=1$，此时看到 `"我 喜欢"`）：预测的是 `"我 喜欢"` 后面该接什么词；
+- **最后一行**（$t=T-1=2$，此时看全了整句 `"我 喜欢 写"`）：预测的才是整句话后面的**下一个新词**！
+
+在**训练阶段**，前 $T-1$ 行的得分至关重要——训练框架会同时拿全部 $T$ 行的预测得分与真实语料中的下一个词比对算损失，用一次前向传播同时训练 $T$ 个预测任务。
+
+但在我们今天运行的**推理生成阶段**，前 $T-1$ 个词本来就是用户已经敲进去的已知文本，无需重猜。因此程序直接丢弃前 $T-1$ 行，只切出**序列最后一个位置**（下标 $T-1$）的那一行 `[B, V]` 得分，并通过 $\arg\max$（贪心解码）挑出得分最高的那一列下标：
 
 $$
 \text{logits}_{\text{last}} = \text{logits}_{\text{all}}[:, T-1, :] \in \mathbb{R}^{[B, V]}, \qquad \text{next\_id} = \arg\max(\text{logits}_{\text{last}})
 $$
 
+最后拿这个整数 `next_id` 反查 `tokenizer.json` 词表，就还原出了模型生成的下一个词（如 `"代码"`）。
+
+---
+
 ### 11. 自回归生成循环（Autoregressive Loop）
 
-单次前向计算仅产出一个新 Token。大模型生成长文的过程，就是将刚生成的 Token ID 拼接到输入序列末尾，循环执行下一轮前向计算，直至命中终止符 `<|im_end|>`（EOS Token）。
+既然跑完一整趟阶段 01 — 10 只能吐出 **1 个新 Token**，大模型是怎么写出一整段回答的？
+
+答案是**自回归生成循环**（Autoregressive Generation）——把上一步刚生成的 Token 拼回输入序列的末尾，作为下一步的输入再跑一轮前向计算：
+
+1. **第 1 轮**：输入 `[1, 3, 4]`（`"我 喜欢 写"`，长 $3$） $\xrightarrow{\text{前向计算}}$ 生成 Token ID `5`（`"代码"`）；
+2. **第 2 轮**：将 `5` 拼在末尾，输入变为 `[1, 3, 4, 5]`（`"我 喜欢 写 代码"`，长 $4$） $\xrightarrow{\text{前向计算}}$ 生成下一个 Token；
+3. **终止条件**：如此循环往复，直到模型在某一轮挑中了代表回答结束的特殊控制词元 `<|im_end|>`（EOS Token，ID 为 `2`），生成循环正式结束。
 
 ---
 
@@ -928,17 +1181,39 @@ cargo run -- --mode real
 
 ## 十、 Prefill、Decode 与 KV Cache
 
-在生成 `"Hello"` 之后的第二个词时，如果把全部 11 个 Token 重新从头算一遍，前 10 个历史 Token 的所有投影与注意力都会被白白重复计算。
+### 1. 如果没有缓存，自回归循环会遇到什么算力灾难？
 
-### 1. 为什么只需缓存 K 和 V？
+在 Step 1 中，我们输入了 10 个 Token（`[1, 10]`），跑完 30 层网络后生成了第 11 个 Token（`19556`, `"Hello"`）。
 
-由于阶段 05 **因果掩码**的存在，前 10 个 Token 根本看不见第 11 个 Token——无论后面追加多少新词，前 10 个位置在各层的隐藏状态及键向量 $\mathbf{K}_{1..10}$、值向量 $\mathbf{V}_{1..10}$ 永远不会改变。
+到了 Step 2，我们要继续预测 `"Hello"` 后面的标点符号。如果按照最朴素的做法，把全部 11 个 Token（`[1, 11]`）重新从头喂进模型：
 
-为了计算第 11 个位置的注意力输出，我们只需用**第 11 个位置自身的查询向量 $\mathbf{q}_{11}: [1, 9, 1, 64]$**，与全部 11 个位置的键矩阵 $\mathbf{K}_{1..11}: [1, 3, 11, 64]$ 和值矩阵 $\mathbf{V}_{1..11}: [1, 3, 11, 64]$ 相乘即可。
+- 前 10 个 Token 的 Embedding 查表要重做一遍；
+- 前 10 个 Token 在 30 层里的 $\mathbf{Q}, \mathbf{K}, \mathbf{V}$ 线性投影与 MLP 计算要全部重算一遍！
+- 当生成到第 1,000 个词时，每吐出 1 个新字，都要把前面 999 个词在 30 层里的矩阵乘法完完全全重算一遍！
 
-因此，**KV Cache**（键值缓存） 只需在显存中保存各层历史位置的 $\mathbf{K}_{\text{rope}}$ 与 $\mathbf{V}$ 激活张量，历史位置的 $\mathbf{Q}$ 用完即弃。
+### 2. 为什么前 10 个词的 K 和 V 永远不会变？（因果掩码的馈赠）
 
-### 2. Step 2（Decode 阶段）真机日志
+仔细想一想：当第 11 个词加到句子末尾时，前 10 个词在每一层算出来的向量真的会改变吗？
+
+**绝对不会改变！** 回想阶段 05 的**因果掩码**：因为右上角未来位置全被抹成了 $-\infty$，前 10 个词在计算注意力时**根本看不见第 11 个词**。因此，无论后面追加多少个新词，前 10 个位置在每一层算出的键向量 $\mathbf{K}_{1..10}$ 和值向量 $\mathbf{V}_{1..10}$，连小数点后最后一位都分毫不差。
+
+那么，在计算第 11 个词（下标 $t=10$）的注意力输出时，到底需要用到前 10 个词的什么数据？
+
+只需用到前 10 个词在各层的 **键向量 $\mathbf{K}_{1..10}$** 和 **值向量 $\mathbf{V}_{1..10}$**！
+
+```text
+Step 2 (Decode) 只输入第 11 个新词 (T_new = 1)：
+  当前新词自己的查询向量：q_11       形状 [1, 9,  1, 64]
+  当前新词算出的新键向量：k_11       形状 [1, 3,  1, 64] ──┐
+  Step 1 已存好的历史键：K_{1..10}   形状 [1, 3, 10, 64] ──┴─► 沿序列维 (dim=2) 拼接为 K_{1..11}: [1, 3, 11, 64]
+```
+
+这就是 **KV Cache**（键值缓存）的全部原理：
+
+- **缓存什么**：在显存中把每一层已经算过的历史位置的 $\mathbf{K}_{\text{rope}}$ 和 $\mathbf{V}$ 张量保存下来（按未广播的 $h_{kv} = 3$ 个键值头存储以省显存）；每当新词进来，只需算出这 **1 个新词**自己的 $\mathbf{k}_{\text{new}}, \mathbf{v}_{\text{new}}$（形状 `[1, 3, 1, 64]`），调用 `Tensor::cat` 拼在历史缓存末尾，就得到了完整的 `[1, 3, 11, 64]`！
+- **为什么不缓存 $\mathbf{Q}$**：因为前 10 个位置的历史查询向量 $\mathbf{Q}_{1..10}$ 只用于预测第 $1 \dots 10$ 个位置各自的下一个词，那些词早已生成完毕，后续步骤永远不会再回头使用旧的 $\mathbf{Q}$。
+
+### 3. Step 2（Decode 阶段）真机日志
 
 在 `--mode real` 输出的下半部分，模型仅喂入刚生成的单Token `[19556]`（形状 `[1, 1]`，`offset = 10`）：
 
@@ -964,7 +1239,7 @@ cargo run -- --mode real
 
 Step 2 选出最高分 Token ID `17`（`"!"`），与 Step 1 的 `"Hello"` 拼接输出 **`"Hello!"`**。
 
-### 3. Prefill 与 Decode 的形状对比
+### 4. Prefill 与 Decode 的形状对比
 
 开启 KV Cache 后，推理过程自然分为两个阶段：
 
